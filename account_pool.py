@@ -1,8 +1,10 @@
 """Account Pool Manager for Claude SST & Conversational Audio.
 
-Manages a pool of Claude accounts, rotates between them to balance load,
+Manages a pool of Claude Farm accounts, rotates between them to balance load,
 handles rate limits (with automatic failover to the next healthy account),
 and tracks account health to avoid using dead/expired sessions.
+
+Strictly excludes personal Gmail / Chrome / Brave accounts.
 """
 
 import os
@@ -18,101 +20,130 @@ import aiohttp
 logger = logging.getLogger("account_pool")
 
 ACCOUNTS_FILE = Path(__file__).parent / "accounts.json"
+CLAUDE_FARM_ACCOUNTS_DIR = Path("/home/wraient/Projects/claude-farm/accounts")
+
+
+def _is_personal_or_gmail(acc: Dict[str, Any]) -> bool:
+    """Detect if an account is a personal browser/Gmail account that must be purged."""
+    acc_id = acc.get("id", "").lower()
+    name = acc.get("name", "").lower()
+    email = acc.get("email", "").lower()
+
+    if "gmail.com" in name or "gmail.com" in email:
+        return True
+    if acc_id in ("chrome_default", "brave_origin"):
+        return True
+    if "chrome" in name or "brave" in name:
+        return True
+    return False
 
 
 class AccountPool:
-    def __init__(self, filepath: Path = ACCOUNTS_FILE):
+    def __init__(self, filepath: Path = ACCOUNTS_FILE, farm_dir: Path = CLAUDE_FARM_ACCOUNTS_DIR):
         self.filepath = filepath
+        self.farm_dir = farm_dir
         self._accounts: List[Dict[str, Any]] = []
         self._lock = asyncio.Lock()
         self._load_or_bootstrap()
 
     def _load_or_bootstrap(self):
-        """Load accounts from accounts.json or bootstrap from browser profiles."""
+        """Load accounts from accounts.json (purging Gmail) and sync from Claude Farm."""
+        existing = []
         if self.filepath.exists():
             try:
                 with open(self.filepath, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    self._accounts = data.get("accounts", [])
-                    logger.info(f"Loaded {len(self._accounts)} accounts from {self.filepath}")
-                    return
+                    raw_accounts = data.get("accounts", [])
+                    # Strictly filter out personal / Gmail accounts
+                    existing = [a for a in raw_accounts if not _is_personal_or_gmail(a)]
+                    logger.info(f"Loaded {len(existing)} non-Gmail accounts from {self.filepath}")
             except Exception as e:
                 logger.error(f"Failed to read {self.filepath}: {e}")
 
-        # If empty or file didn't exist, bootstrap from discovered browser accounts
-        self._bootstrap_browser_accounts()
-
-    def _bootstrap_browser_accounts(self):
-        """Discover existing Claude accounts from Chrome and Brave."""
-        from auth import extract_chrome_claude_cookies, get_chrome_key, decrypt_v11
-        import sqlite3
-        import shutil
-        import hashlib
-
-        discovered = []
-
-        # 1. Chrome
-        try:
-            cookies = extract_chrome_claude_cookies()
-            sk = cookies.get("sessionKey")
-            org = cookies.get("lastActiveOrg", "")
-            if sk:
-                discovered.append({
-                    "id": "chrome_default",
-                    "name": "Chrome Account",
-                    "sessionKey": sk,
-                    "orgUuid": org,
-                    "status": "active",
-                    "rate_limited_until": 0,
-                    "last_used": 0,
-                    "usage_count": 0,
-                    "error_count": 0,
-                    "last_error": None,
-                })
-        except Exception as e:
-            logger.debug(f"Chrome discovery error: {e}")
-
-        # 2. Brave
-        try:
-            salt = b"saltysalt"
-            key = hashlib.pbkdf2_hmac("sha1", "QPTzDTCQmsqy4E1HNR/jxg==".encode("utf-8"), salt, 1, 16)
-            brave_p = Path.home() / ".config" / "BraveSoftware" / "Brave-Origin" / "Default" / "Cookies"
-            if brave_p.exists():
-                tmp = Path("/tmp/brave_bootstrap.sqlite")
-                shutil.copy2(brave_p, tmp)
-                conn = sqlite3.connect(tmp)
-                cur = conn.cursor()
-                cur.execute('SELECT encrypted_value FROM cookies WHERE host_key LIKE "%claude.ai%" AND name = "sessionKey"')
-                row = cur.fetchone()
-                if row:
-                    sk = decrypt_v11(row[0], key)
-                    if sk and sk not in [d["sessionKey"] for d in discovered]:
-                        discovered.append({
-                            "id": "brave_origin",
-                            "name": "Brave Account",
-                            "sessionKey": sk,
-                            "orgUuid": "",
-                            "status": "active",
-                            "rate_limited_until": 0,
-                            "last_used": 0,
-                            "usage_count": 0,
-                            "error_count": 0,
-                            "last_error": None,
-                        })
-                conn.close()
-                tmp.unlink(missing_ok=True)
-        except Exception as e:
-            logger.debug(f"Brave discovery error: {e}")
-
-        self._accounts = discovered
+        self._accounts = existing
+        # Synchronize with Claude Farm accounts directory
+        self.sync_claude_farm_accounts(save=False)
         self._save_sync()
+
+    def sync_claude_farm_accounts(self, save: bool = True) -> int:
+        """Scan Claude Farm accounts directory for valid accounts and update pool."""
+        if not self.farm_dir.exists():
+            logger.warning(f"Claude Farm directory does not exist: {self.farm_dir}")
+            return 0
+
+        added_or_updated = 0
+        known_by_email = {a.get("email", "").lower(): a for a in self._accounts if a.get("email")}
+        known_by_key = {a.get("sessionKey", ""): a for a in self._accounts}
+
+        for meta_file in self.farm_dir.glob("*/meta.json"):
+            # Skip expired/archived subdirectories
+            if "expired" in meta_file.parts:
+                continue
+            try:
+                with open(meta_file, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+
+                email = (meta.get("email") or meta_file.parent.name).strip().lower()
+                sk = (meta.get("session_key") or "").strip()
+                org_id = (meta.get("org_id") or "").strip()
+
+                if not sk or "gmail.com" in email:
+                    continue
+
+                if email in known_by_email:
+                    acc = known_by_email[email]
+                    if acc.get("sessionKey") != sk or acc.get("orgUuid") != org_id:
+                        acc["sessionKey"] = sk
+                        if org_id:
+                            acc["orgUuid"] = org_id
+                        acc["status"] = "active"
+                        acc["last_error"] = None
+                        added_or_updated += 1
+                elif sk in known_by_key:
+                    acc = known_by_key[sk]
+                    acc["email"] = email
+                    if org_id:
+                        acc["orgUuid"] = org_id
+                else:
+                    safe_id = f"farm_{email.replace('@', '_').replace('.', '_')}"
+                    new_acc = {
+                        "id": safe_id,
+                        "email": email,
+                        "name": f"{email}'s Organization",
+                        "sessionKey": sk,
+                        "orgUuid": org_id,
+                        "status": "active",
+                        "rate_limited_until": 0,
+                        "last_used": 0,
+                        "usage_count": 0,
+                        "error_count": 0,
+                        "last_error": None,
+                    }
+                    self._accounts.append(new_acc)
+                    known_by_email[email] = new_acc
+                    known_by_key[sk] = new_acc
+                    added_or_updated += 1
+                    logger.info(f"[ACCOUNT_POOL] Discovered Claude Farm account: {email}")
+
+            except Exception as e:
+                logger.debug(f"Error reading {meta_file}: {e}")
+
+        # Purge any remaining personal Gmail entries
+        self._accounts = [a for a in self._accounts if not _is_personal_or_gmail(a)]
+
+        if save:
+            self._save_sync()
+
+        return added_or_updated
 
     def _save_sync(self):
         """Save account state to disk."""
         try:
             self.filepath.parent.mkdir(parents=True, exist_ok=True)
+            # Ensure no Gmail accounts ever persist
+            clean_accounts = [a for a in self._accounts if not _is_personal_or_gmail(a)]
             with open(self.filepath, "w", encoding="utf-8") as f:
-                json.dump({"accounts": self._accounts}, f, indent=2)
+                json.dump({"accounts": clean_accounts}, f, indent=2)
         except Exception as e:
             logger.error(f"Failed to save accounts to {self.filepath}: {e}")
 
@@ -124,7 +155,7 @@ class AccountPool:
         """
         headers = {
             "Cookie": f"sessionKey={session_key}",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "Origin": "https://claude.ai",
             "Referer": "https://claude.ai/new",
         }
@@ -150,11 +181,13 @@ class AccountPool:
             return False, None, None, str(e)
 
     async def initialize(self):
-        """Initial check and metadata population for accounts."""
+        """Initial sync from Claude Farm and metadata validation."""
         async with self._lock:
+            # Sync fresh accounts from Claude Farm
+            self.sync_claude_farm_accounts(save=False)
             modified = False
             for acc in self._accounts:
-                if not acc.get("orgUuid") or acc.get("name") in ("Chrome Account", "Brave Account"):
+                if not acc.get("orgUuid") or not acc.get("name"):
                     valid, org_uuid, org_name, err = await self.validate_session_key(acc["sessionKey"])
                     if valid and org_uuid:
                         acc["orgUuid"] = org_uuid
@@ -210,10 +243,10 @@ class AccountPool:
             dead_count = sum(1 for a in self._accounts if a["status"] == "dead")
             if dead_count == len(self._accounts) and self._accounts:
                 raise RuntimeError(
-                    f"All {dead_count} Claude accounts in the pool are dead/expired. Please update session keys."
+                    f"All {dead_count} Claude accounts in the pool are dead/expired. Please generate fresh accounts via claude-farm."
                 )
 
-            raise RuntimeError("No available Claude accounts in pool.")
+            raise RuntimeError("No available Claude accounts in pool. Please check Claude Farm accounts.")
 
         # 3. Sort by least-recently-used (last_used ascending)
         candidates.sort(key=lambda a: a.get("last_used", 0))
@@ -275,7 +308,7 @@ class AccountPool:
         acc_id = f"acc_{uuid.uuid4().hex[:8]}"
         account = {
             "id": acc_id,
-            "name": name or discovered_name or f"Claude Account {len(self._accounts) + 1}",
+            "name": name or discovered_name or f"Claude Farm Account {len(self._accounts) + 1}",
             "sessionKey": session_key,
             "orgUuid": org_uuid or discovered_org or "",
             "status": "active",
@@ -316,7 +349,7 @@ class AccountPool:
             target["last_error"] = None
             if org_uuid:
                 target["orgUuid"] = org_uuid
-            if org_name and target["name"].startswith("Claude Account"):
+            if org_name:
                 target["name"] = org_name
         else:
             if "429" in str(err):
@@ -338,8 +371,7 @@ class AccountPool:
             if mask_keys and item.get("sessionKey"):
                 sk = item["sessionKey"]
                 item["sessionKey"] = sk[:15] + "..." + sk[-6:] if len(sk) > 25 else "..."
-            
-            # Add dynamic fields
+
             rl_until = item.get("rate_limited_until", 0)
             if item["status"] == "rate_limited" and rl_until > now:
                 item["cooldown_seconds_remaining"] = int(rl_until - now)
