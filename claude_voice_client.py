@@ -3,6 +3,7 @@
 Supports real-time streaming speech-to-text, prompt extraction, and automated
 speech-interruption to suppress Claude's voice output for pure SST usage.
 Includes multi-account pooling, automatic rotation, and failover on rate limits.
+Includes real-time DC offset blocking and multi-utterance pause accumulation.
 """
 
 import asyncio
@@ -12,6 +13,7 @@ import urllib.parse
 import uuid
 from typing import AsyncGenerator, Dict, Any, Optional, List
 import aiohttp
+import numpy as np
 
 from auth import auth_manager
 from account_pool import account_pool
@@ -19,8 +21,36 @@ from account_pool import account_pool
 logger = logging.getLogger("claude_voice")
 
 
+class StreamingDCBlocker:
+    """Real-time DC offset and subsonic microphone rumble filter.
+
+    Maintains a low-latency running estimate of DC bias and centers 16-bit linear PCM
+    around 0 to avoid choking Claude's VAD/AEC speech detector.
+    """
+
+    def __init__(self, alpha: float = 0.05):
+        self.alpha = alpha
+        self.running_dc: float = 0.0
+        self.initialized: bool = False
+
+    def process_bytes(self, pcm_bytes: bytes) -> bytes:
+        if not pcm_bytes:
+            return pcm_bytes
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+        if len(samples) == 0:
+            return pcm_bytes
+        chunk_mean = float(np.mean(samples))
+        if not self.initialized:
+            self.running_dc = chunk_mean
+            self.initialized = True
+        else:
+            self.running_dc = (1.0 - self.alpha) * self.running_dc + self.alpha * chunk_mean
+        centered = samples - self.running_dc
+        return np.clip(centered, -32768, 32767).astype(np.int16).tobytes()
+
+
 def combine_transcripts(history: List[str], current: str) -> str:
-    """Combines a list of finalized utterances with the current utterance.
+    """Combines a list of finalized utterances with the current utterance across pauses.
 
     Prevents repetitive duplication by checking if current starts with or contains
     parts of previous utterances, or vice-versa.
@@ -47,7 +77,9 @@ def combine_transcripts(history: List[str], current: str) -> str:
         curr_words = curr.split()
         overlap_found = False
         for k in range(min(len(last_words), len(curr_words)), 0, -1):
-            if last_words[-k:] == curr_words[:k]:
+            lw = [w.lower().strip(".,?!;:-_") for w in last_words[-k:]]
+            cw = [w.lower().strip(".,?!;:-_") for w in curr_words[:k]]
+            if lw == cw:
                 # Overlap of k words
                 merged = last_words + curr_words[k:]
                 combined[-1] = " ".join(merged)
@@ -90,6 +122,7 @@ class ClaudeVoiceSession:
         self._keepalive_task: Optional[asyncio.Task] = None
         self._is_closed = False
         self._interrupted = False
+        self._dc_blocker = StreamingDCBlocker(alpha=0.05)
 
         # Multi-turn transcript accumulation:
         # Keeps history of all confirmed utterances across pauses
@@ -238,9 +271,10 @@ class ClaudeVoiceSession:
             logger.debug(f"Keepalive loop stopped: {e}")
 
     async def send_audio_chunk(self, pcm_chunk: bytes):
-        """Send raw PCM linear16 16kHz audio chunk to Claude."""
+        """Send raw PCM linear16 16kHz audio chunk to Claude after stripping DC offset."""
         if self._ws and not self._ws.closed:
-            await self._ws.send_bytes(pcm_chunk)
+            cleaned = self._dc_blocker.process_bytes(pcm_chunk)
+            await self._ws.send_bytes(cleaned)
 
     async def send_interrupt(self):
         """Send interrupt signal to Claude to stop audio generation immediately."""
@@ -291,6 +325,22 @@ class ClaudeVoiceSession:
                     if event_type in ("transcript_interim", "prompt_delta", "prompt"):
                         txt = data.get("text", "")
                         if txt:
+                            seq = data.get("utterance_seq")
+                            # Detect when a new utterance begins after a pause
+                            is_new_utterance = False
+                            if seq == 0 and self._current_turn_text.strip():
+                                if not txt.strip().startswith(self._current_turn_text.strip()):
+                                    is_new_utterance = True
+                            elif self._current_turn_text.strip() and len(txt.strip()) < len(self._current_turn_text.strip()) * 0.4:
+                                if not txt.strip().startswith(self._current_turn_text.strip()[:10]):
+                                    is_new_utterance = True
+
+                            if is_new_utterance:
+                                curr = self._current_turn_text.strip()
+                                if not self._history_utterances or self._history_utterances[-1] != curr:
+                                    self._history_utterances.append(curr)
+                                self._current_turn_text = ""
+
                             self._current_turn_text = txt
                             self._accumulated_text = self.accumulated_text
                             yield {
@@ -300,12 +350,21 @@ class ClaudeVoiceSession:
                                 "full_text": self._accumulated_text,
                             }
 
-                    # 2. Assistant Turn Starting -> We suppress the reply!
+                    elif event_type == "transcript_empty":
+                        # Silence detected / pause between utterances:
+                        # Lock in any current turn text into history so it is never lost
+                        if self._current_turn_text.strip():
+                            curr = self._current_turn_text.strip()
+                            if not self._history_utterances or self._history_utterances[-1] != curr:
+                                self._history_utterances.append(curr)
+                            self._current_turn_text = ""
+
+                    # 2. Assistant Turn Starting / Turn End -> Suppress reply!
                     elif (
-                        event_type in ("assistant_audio", "assistant_delta", "turn_start", "tts_word", "playback_end")
+                        event_type in ("assistant_audio", "assistant_delta", "turn_start", "tts_word", "playback_end", "user_input_end")
                         or (event_type == "message_sse" and data.get("event", {}).get("type") in ("message_start", "content_block_start"))
                     ):
-                        # If a turn just finished, archive the current turn text into history
+                        # Archive current turn text into history
                         if self._current_turn_text.strip():
                             curr = self._current_turn_text.strip()
                             if not self._history_utterances or self._history_utterances[-1] != curr:
