@@ -37,6 +37,7 @@ from aiohttp import web
 from auth import auth_manager
 from claude_sst_client import ClaudeSSTSession
 from claude_voice_client import ClaudeVoiceSession
+from account_pool import account_pool
 
 logging.basicConfig(
     level=logging.INFO,
@@ -556,6 +557,93 @@ Stream 16kHz PCM &rarr; Receive {"type": "final", "text": "..."}
       ws = null;
     }
 
+    async function fetchAccounts() {
+      try {
+        const res = await fetch('/v1/accounts');
+        if (!res.ok) return;
+        const data = await res.json();
+        const tbody = document.getElementById('accountsTableBody');
+        const badges = document.getElementById('poolBadges');
+        tbody.innerHTML = '';
+
+        badges.innerHTML = `
+          <span style="padding:0.25rem 0.6rem; border-radius:12px; font-size:0.75rem; font-weight:600; background:rgba(34,197,94,0.15); color:var(--success); border:1px solid var(--success);">${data.active} Active</span>
+          ${data.rate_limited ? `<span style="padding:0.25rem 0.6rem; border-radius:12px; font-size:0.75rem; font-weight:600; background:rgba(234,179,8,0.15); color:#eab308; border:1px solid #eab308;">${data.rate_limited} Rate-Limited</span>` : ''}
+          ${data.dead ? `<span style="padding:0.25rem 0.6rem; border-radius:12px; font-size:0.75rem; font-weight:600; background:rgba(239,68,68,0.15); color:var(--danger); border:1px solid var(--danger);">${data.dead} Dead</span>` : ''}
+        `;
+
+        for (const acc of data.accounts) {
+          const tr = document.createElement('tr');
+          tr.style.borderBottom = '1px solid #25252c';
+
+          let statusBadge = '';
+          if (acc.status === 'active') {
+            statusBadge = '<span style="color:var(--success); font-weight:600;">🟢 Active</span>';
+          } else if (acc.status === 'rate_limited') {
+            const cd = acc.cooldown_seconds_remaining || 0;
+            statusBadge = `<span style="color:#eab308; font-weight:600;">🟡 Rate Limited (${cd}s)</span>`;
+          } else {
+            statusBadge = `<span style="color:var(--danger); font-weight:600;" title="${acc.last_error || ''}">🔴 Dead</span>`;
+          }
+
+          tr.innerHTML = `
+            <td style="padding:0.5rem;"><strong>${acc.name || acc.id}</strong><br><small style="color:var(--text-muted); font-size:0.7rem;">${acc.orgUuid || 'Default Org'}</small></td>
+            <td style="padding:0.5rem;">${statusBadge}</td>
+            <td style="padding:0.5rem;"><span style="color:var(--claude-blue);">${acc.usage_count || 0}</span> calls</td>
+            <td style="padding:0.5rem; font-family:monospace; color:var(--text-muted);">${acc.sessionKey}</td>
+            <td style="padding:0.5rem; text-align:right;">
+              <button onclick="refreshAccount('${acc.id}')" style="background:none; border:1px solid var(--border); color:var(--text-muted); padding:0.2rem 0.5rem; border-radius:4px; cursor:pointer; font-size:0.75rem; margin-right:4px;">Check</button>
+              <button onclick="deleteAccount('${acc.id}')" style="background:none; border:1px solid rgba(239,68,68,0.3); color:var(--danger); padding:0.2rem 0.5rem; border-radius:4px; cursor:pointer; font-size:0.75rem;">Del</button>
+            </td>
+          `;
+          tbody.appendChild(tr);
+        }
+      } catch (e) {
+        console.error('Failed to fetch accounts:', e);
+      }
+    }
+
+    async function addNewAccount() {
+      const keyInput = document.getElementById('newSessionKey');
+      const nameInput = document.getElementById('newAccountName');
+      const sk = keyInput.value.trim();
+      const name = nameInput.value.trim();
+      if (!sk) { alert('Please enter a sessionKey'); return; }
+
+      try {
+        const res = await fetch('/v1/accounts', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({sessionKey: sk, name: name || undefined})
+        });
+        const d = await res.json();
+        if (res.ok) {
+          keyInput.value = '';
+          nameInput.value = '';
+          fetchAccounts();
+          alert('Account added and verified successfully!');
+        } else {
+          alert('Error adding account: ' + (d.error || 'Failed'));
+        }
+      } catch (e) {
+        alert('Request failed: ' + e);
+      }
+    }
+
+    async function refreshAccount(id) {
+      await fetch(`/v1/accounts/${id}/refresh`, {method: 'POST'});
+      fetchAccounts();
+    }
+
+    async function deleteAccount(id) {
+      if (!confirm('Are you sure you want to remove this account?')) return;
+      await fetch(`/v1/accounts/${id}`, {method: 'DELETE'});
+      fetchAccounts();
+    }
+
+    fetchAccounts();
+    setInterval(fetchAccounts, 5000);
+
     micBtn.addEventListener('click', () => {
       if (isRecording) stopRecording();
       else startRecording();
@@ -577,15 +665,76 @@ async def handle_index(request: web.Request) -> web.Response:
 @routes.get("/health")
 async def handle_health(request: web.Request) -> web.Response:
     try:
+        accounts = account_pool.list_accounts()
+        active_count = sum(1 for a in accounts if a["status"] == "active")
+        rate_limited_count = sum(1 for a in accounts if a["status"] == "rate_limited")
+        dead_count = sum(1 for a in accounts if a["status"] == "dead")
         _, session_key, org_uuid = auth_manager.get_credentials()
+
         return web.json_response({
             "status": "healthy",
             "authenticated": bool(session_key),
             "org_uuid": org_uuid,
             "session_prefix": session_key[:15] + "..." if session_key else None,
+            "accounts": {
+                "total": len(accounts),
+                "active": active_count,
+                "rate_limited": rate_limited_count,
+                "dead": dead_count,
+            },
+            "backup_storage": {
+                "path": "/home/wraient/Recordings/hyprwhspr",
+                "exists": os.path.exists("/home/wraient/Recordings/hyprwhspr"),
+            }
         })
     except Exception as e:
         return web.json_response({"status": "unhealthy", "error": str(e)}, status=500)
+
+
+@routes.get("/v1/accounts")
+async def handle_list_accounts(request: web.Request) -> web.Response:
+    accounts = account_pool.list_accounts()
+    return web.json_response({
+        "accounts": accounts,
+        "total": len(account_pool._accounts),
+        "active": sum(1 for a in account_pool._accounts if a["status"] == "active"),
+        "rate_limited": sum(1 for a in account_pool._accounts if a["status"] == "rate_limited"),
+        "dead": sum(1 for a in account_pool._accounts if a["status"] == "dead"),
+    })
+
+
+@routes.post("/v1/accounts")
+async def handle_add_account(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+        session_key = data.get("sessionKey", "").strip()
+        name = data.get("name", "").strip() or None
+        org_uuid = data.get("orgUuid", "").strip() or None
+        if not session_key:
+            return web.json_response({"error": "sessionKey is required"}, status=400)
+        account = await account_pool.add_account(session_key=session_key, name=name, org_uuid=org_uuid)
+        return web.json_response({"status": "ok", "account": account})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=400)
+
+
+@routes.delete("/v1/accounts/{id}")
+async def handle_delete_account(request: web.Request) -> web.Response:
+    acc_id = request.match_info["id"]
+    removed = account_pool.remove_account(acc_id)
+    if removed:
+        return web.json_response({"status": "deleted", "id": acc_id})
+    return web.json_response({"error": "Account not found"}, status=404)
+
+
+@routes.post("/v1/accounts/{id}/refresh")
+async def handle_refresh_account(request: web.Request) -> web.Response:
+    acc_id = request.match_info["id"]
+    try:
+        acc = await account_pool.refresh_account(acc_id)
+        return web.json_response({"status": "refreshed", "account": acc})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=400)
 
 
 # =====================================================================
@@ -624,7 +773,9 @@ async def handle_ws_smart_sst(request: web.Request) -> web.WebSocketResponse:
                     try:
                         data = json.loads(msg.data)
                         if data.get("action") == "stop":
+                            await voice_session.flush_and_finish_turn()
                             await voice_session.send_interrupt()
+                            await asyncio.sleep(1.2)
                             break
                     except Exception:
                         pass
@@ -935,9 +1086,14 @@ async def handle_ws_realtime(request: web.Request) -> web.WebSocketResponse:
                             for _ in range(4):
                                 await voice_session.send_audio(bytes(3200))
                                 await asyncio.sleep(0.01)
-                            await asyncio.sleep(0.12)
-                            await voice_session.send_interrupt()
 
+                            # If text has not arrived yet (e.g. fast streaming test), wait up to 2 seconds
+                            for _ in range(25):
+                                if voice_session.accumulated_text.strip():
+                                    break
+                                await asyncio.sleep(0.08)
+
+                            await voice_session.send_interrupt()
                             final_transcript = voice_session.accumulated_text
                         else:
                             final_transcript = ""
@@ -1106,6 +1262,12 @@ async def handle_transcriptions(request: web.Request) -> web.Response:
 def create_app() -> web.Application:
     app = web.Application(client_max_size=50 * 1024 * 1024)
     app.add_routes(routes)
+
+    async def on_startup(app: web.Application):
+        await account_pool.initialize()
+        logger.info(f"Initialized Account Pool with {len(account_pool._accounts)} accounts")
+
+    app.on_startup.append(on_startup)
     return app
 
 

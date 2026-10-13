@@ -1,7 +1,7 @@
 """Authentication module for Claude SST.
 
-Extracts session cookies directly from Google Chrome (Linux / Gnome Keyring)
-or environment variables.
+Extracts session cookies directly from Google Chrome (Linux / Gnome Keyring),
+Brave Browser, environment variables, or the multi-account pool.
 """
 
 import os
@@ -10,7 +10,7 @@ import sqlite3
 import hashlib
 import subprocess
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Any
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 CHROME_COOKIE_PATH = Path.home() / ".config" / "google-chrome" / "Default" / "Cookies"
@@ -40,7 +40,7 @@ def get_chrome_key() -> Optional[bytes]:
 
 
 def decrypt_v11(data: bytes, key: bytes) -> Optional[str]:
-    """Decrypt Chrome v11 encrypted cookie value."""
+    """Decrypt Chrome / Chromium v11 encrypted cookie value."""
     if not data or not data.startswith(b"v11"):
         return None
     try:
@@ -90,19 +90,18 @@ def extract_chrome_claude_cookies() -> Dict[str, str]:
 
 
 class ClaudeAuth:
-    """Manages Claude session credentials and headers."""
+    """Manages Claude session credentials and headers across account pool."""
 
     def __init__(self):
-        self._cached_cookies: Dict[str, str] = {}
         self._session_key: Optional[str] = os.getenv("CLAUDE_SESSION_KEY")
         self._org_uuid: Optional[str] = os.getenv("CLAUDE_ORG_UUID")
 
-    def get_credentials(self) -> Tuple[Dict[str, str], str, str]:
+    def get_credentials(self, account_id: Optional[str] = None) -> Tuple[Dict[str, str], str, str]:
         """Returns (cookie_dict, session_key, org_uuid).
 
-        Refreshes cookies from Chrome if needed.
+        Selects an account from the pool or environment.
         """
-        # 1. Environment variables if provided
+        # 1. Environment variables if explicitly provided
         if self._session_key and self._org_uuid:
             cookie_dict = {
                 "sessionKey": self._session_key,
@@ -110,32 +109,42 @@ class ClaudeAuth:
             }
             return cookie_dict, self._session_key, self._org_uuid
 
-        # 2. Extract from Chrome
+        # 2. Select from Account Pool
+        try:
+            from account_pool import account_pool
+            acc = account_pool.get_next_account() if not account_id else next((a for a in account_pool._accounts if a["id"] == account_id), None)
+            if acc:
+                cookie_dict = {
+                    "sessionKey": acc["sessionKey"],
+                    "lastActiveOrg": acc.get("orgUuid", ""),
+                }
+                return cookie_dict, acc["sessionKey"], acc.get("orgUuid", "")
+        except Exception:
+            pass
+
+        # 3. Fallback to direct Chrome extraction
         cookies = extract_chrome_claude_cookies()
         if cookies and "sessionKey" in cookies:
-            self._cached_cookies = cookies
             session_key = cookies["sessionKey"]
             org_uuid = cookies.get("lastActiveOrg", "")
             return cookies, session_key, org_uuid
 
-        # 3. Fallback to cached
-        if self._cached_cookies and "sessionKey" in self._cached_cookies:
-            return (
-                self._cached_cookies,
-                self._cached_cookies["sessionKey"],
-                self._cached_cookies.get("lastActiveOrg", ""),
-            )
-
         raise RuntimeError(
-            "No valid Claude cookies found. Please log in to claude.ai in Chrome or set CLAUDE_SESSION_KEY and CLAUDE_ORG_UUID in the environment."
+            "No valid Claude accounts found. Please add accounts to the pool or log in to claude.ai in Chrome."
         )
 
-    def get_headers(self) -> Dict[str, str]:
-        cookies, session_key, org_uuid = self.get_credentials()
-        cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    def get_headers(self, account: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+        if account:
+            session_key = account.get("sessionKey", "")
+            org_uuid = account.get("orgUuid", "")
+            cookie_str = f"sessionKey={session_key}; lastActiveOrg={org_uuid}"
+        else:
+            cookies, session_key, org_uuid = self.get_credentials()
+            cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+
         return {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-            "Cookie": cookie_header,
+            "Cookie": cookie_str,
             "Origin": "https://claude.ai",
             "Referer": "https://claude.ai/new",
         }

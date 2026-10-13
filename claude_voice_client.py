@@ -1,9 +1,8 @@
-"""Claude Conversational Audio / Voice Mode Client.
+"""Client for Anthropic Claude Web Voice Mode (Conversational Audio) WebSocket.
 
-Supports:
-1. Full Voice Conversation (User speaks -> Prompt updates -> Claude answers).
-2. Conversational SST Only (User speaks -> Prompt updates with full conversational engine
-   -> Claude answer is suppressed & interrupted -> Clean prompt returned without Claude reply).
+Supports real-time streaming speech-to-text, prompt extraction, and automated
+speech-interruption to suppress Claude's voice output for pure SST usage.
+Includes multi-account pooling, automatic rotation, and failover on rate limits.
 """
 
 import asyncio
@@ -15,73 +14,76 @@ from typing import AsyncGenerator, Dict, Any, Optional, List
 import aiohttp
 
 from auth import auth_manager
+from account_pool import account_pool
 
 logger = logging.getLogger("claude_voice")
 
 
 def combine_transcripts(history: List[str], current: str) -> str:
-    """Seamlessly combine committed turn history and current live utterance,
+    """Combines a list of finalized utterances with the current utterance.
 
-    avoiding duplicate overlapping boundary words across pauses and turns.
+    Prevents repetitive duplication by checking if current starts with or contains
+    parts of previous utterances, or vice-versa.
     """
-    cleaned_history = [h.strip() for h in history if h and h.strip()]
-    cleaned_current = current.strip() if current else ""
+    valid_parts = [p.strip() for p in history if p and p.strip()]
+    curr = current.strip()
 
-    if not cleaned_history:
-        return cleaned_current
-    if not cleaned_current:
-        return " ".join(cleaned_history)
+    if not valid_parts:
+        return curr
+    if not curr:
+        return " ".join(valid_parts)
 
-    full_history = " ".join(cleaned_history)
+    combined = list(valid_parts)
+    last_hist = combined[-1]
 
-    # If current already contains full_history
-    if cleaned_current.startswith(full_history):
-        return cleaned_current
+    # If the current utterance already contains the last history item, replace or append cleanly
+    if curr.startswith(last_hist):
+        combined[-1] = curr
+    elif last_hist.endswith(curr):
+        pass  # Already included
+    else:
+        # Check for word-level suffix/prefix overlap
+        last_words = last_hist.split()
+        curr_words = curr.split()
+        overlap_found = False
+        for k in range(min(len(last_words), len(curr_words)), 0, -1):
+            if last_words[-k:] == curr_words[:k]:
+                # Overlap of k words
+                merged = last_words + curr_words[k:]
+                combined[-1] = " ".join(merged)
+                overlap_found = True
+                break
+        if not overlap_found:
+            combined.append(curr)
 
-    # If current already contains the last turn
-    last_item = cleaned_history[-1]
-    if cleaned_current.startswith(last_item):
-        prefix = " ".join(cleaned_history[:-1])
-        return f"{prefix} {cleaned_current}".strip()
-
-    # Word-level suffix overlap check to eliminate duplicate boundary words
-    hist_words = full_history.split()
-    curr_words = cleaned_current.split()
-    max_overlap = min(len(hist_words), len(curr_words), 8)
-    overlap_len = 0
-    for k in range(max_overlap, 0, -1):
-        h_slice = [w.lower().strip(".,?!;:'\"") for w in hist_words[-k:]]
-        c_slice = [w.lower().strip(".,?!;:'\"") for w in curr_words[:k]]
-        if h_slice == c_slice:
-            overlap_len = k
-            break
-
-    if overlap_len > 0:
-        return " ".join(hist_words[:-overlap_len] + curr_words)
-
-    return f"{full_history} {cleaned_current}".strip()
+    return " ".join(combined)
 
 
 class ClaudeVoiceSession:
-    """Session connected to Claude's Conversational Voice Mode WebSocket."""
+    """A single bidirectional session connected to Claude's Voice Mode WebSocket.
+
+    Extracts user prompt deltas and accumulated text in real-time, while suppressing Claude's audio reply.
+    Rotates accounts and handles rate-limits automatically.
+    """
 
     def __init__(
         self,
-        conversation_uuid: Optional[str] = None,
-        language: str = "en",
         voice: str = "buttery",
+        language: str = "en",
+        suppress_reply: bool = True,
+        ephemeral: bool = True,
         sample_rate: int = 16000,
         model: Optional[str] = None,
-        suppress_reply: bool = False,
-        ephemeral: bool = False,
+        account: Optional[Dict[str, Any]] = None,
     ):
-        self.conversation_uuid = conversation_uuid or str(uuid.uuid4())
-        self.language = language
         self.voice = voice
+        self.language = language
+        self.suppress_reply = suppress_reply
+        self.ephemeral = ephemeral
         self.sample_rate = sample_rate
         self.model = model
-        self.suppress_reply = suppress_reply
-        self.ephemeral = ephemeral or suppress_reply
+        self.account = account
+        self.conversation_uuid = str(uuid.uuid4())
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
@@ -89,7 +91,8 @@ class ClaudeVoiceSession:
         self._is_closed = False
         self._interrupted = False
 
-        # Accumulation state across pauses and multi-turn utterances
+        # Multi-turn transcript accumulation:
+        # Keeps history of all confirmed utterances across pauses
         self._history_utterances: List[str] = []
         self._current_turn_text: str = ""
         self._accumulated_text: str = ""
@@ -99,242 +102,265 @@ class ClaudeVoiceSession:
         """Returns the full accumulated transcript from the moment recording started."""
         return combine_transcripts(self._history_utterances, self._current_turn_text)
 
-    async def _ensure_conversation_exists(self):
-        """Create conversation in Claude if it doesn't already exist."""
-        _, _, org_uuid = auth_manager.get_credentials()
-        headers = auth_manager.get_headers()
-        headers["Content-Type"] = "application/json"
+    async def connect(self, max_retries: int = 3):
+        """Connect to Claude's Voice Mode WebSocket with automatic account failover."""
+        attempt = 0
+        tried_ids: List[str] = []
+        last_error = None
 
-        url = f"https://claude.ai/api/organizations/{org_uuid}/chat_conversations"
-        payload = {
-            "uuid": self.conversation_uuid,
-            "name": "Conversational SST" if self.suppress_reply else "Audio Mode Session",
-            "include_conversation_preferences": True,
-        }
-        if self.model:
-            payload["model"] = self.model
+        while attempt < max_retries:
+            attempt += 1
+            if not self.account or self.account["id"] in tried_ids:
+                try:
+                    self.account = account_pool.get_next_account(exclude_ids=tried_ids)
+                except Exception as e:
+                    logger.error(f"No available healthy Claude account in pool: {e}")
+                    raise RuntimeError(f"All Claude accounts in pool are rate-limited or unavailable: {e}")
 
-        async with aiohttp.ClientSession() as s:
+            acc_id = self.account["id"]
+            acc_name = self.account.get("name", acc_id)
+            tried_ids.append(acc_id)
+            session_key = self.account["sessionKey"]
+            org_uuid = self.account.get("orgUuid", "")
+
+            # Ensure orgUuid exists
+            if not org_uuid:
+                valid, org_uuid, org_name, err = await account_pool.validate_session_key(session_key)
+                if not valid:
+                    account_pool.mark_dead(acc_id, reason=err or "Invalid session")
+                    continue
+                self.account["orgUuid"] = org_uuid
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                "Cookie": f"sessionKey={session_key}; lastActiveOrg={org_uuid}",
+                "Origin": "https://claude.ai",
+                "Referer": "https://claude.ai/new",
+            }
+
+            # 1. Create conversation in Claude
+            conv_url = f"https://claude.ai/api/organizations/{org_uuid}/chat_conversations"
+            conv_payload = {
+                "uuid": self.conversation_uuid,
+                "name": "Conversational SST" if self.suppress_reply else "Audio Mode Session",
+                "include_conversation_preferences": True,
+            }
+            if self.model:
+                conv_payload["model"] = self.model
+
             try:
-                async with s.post(url, headers=headers, json=payload, timeout=10) as resp:
-                    if resp.status in (200, 201):
-                        logger.info(f"Initialized conversation {self.conversation_uuid}")
+                timeout = aiohttp.ClientTimeout(total=8)
+                async with aiohttp.ClientSession(timeout=timeout) as s:
+                    async with s.post(conv_url, headers={**headers, "Content-Type": "application/json"}, json=conv_payload) as resp:
+                        if resp.status == 429:
+                            account_pool.mark_rate_limited(acc_id, cooldown_seconds=900, reason="Conversation HTTP 429")
+                            continue
+                        elif resp.status in (401, 403):
+                            account_pool.mark_dead(acc_id, reason=f"Conversation HTTP {resp.status}")
+                            continue
+                        elif resp.status in (200, 201):
+                            logger.info(f"Initialized conversation {self.conversation_uuid} with account '{acc_name}'")
             except Exception as e:
-                logger.warning(f"Error creating conversation: {e}")
+                logger.warning(f"Notice creating conversation with account '{acc_name}': {e}")
 
-    async def connect(self):
-        """Connect to Claude's Voice Mode WebSocket."""
-        await self._ensure_conversation_exists()
-        _, _, org_uuid = auth_manager.get_credentials()
-        headers = auth_manager.get_headers()
+            # 2. Connect Voice Mode WebSocket
+            params = {
+                "input_encoding": "linear16",
+                "input_sample_rate": str(self.sample_rate),
+                "input_channels": "1",
+                "output_format": "pcm_16000",
+                "language": self.language,
+                "timezone": "Asia/Kolkata",
+                "tts_speed": "1.00",
+                "server_interrupt_enabled": "true",
+                "client_aec": "true",
+                "client_platform": "web_claude_ai",
+                "entry_source": "chat_button",
+                "connect_reason": "initial",
+                "voice": self.voice,
+            }
+            if self.ephemeral:
+                params["chat_memory_mode"] = "disabled"
+            if self.model:
+                params["model"] = self.model
 
-        params = {
-            "input_encoding": "linear16",
-            "input_sample_rate": str(self.sample_rate),
-            "input_channels": "1",
-            "output_format": "pcm_16000",
-            "language": self.language,
-            "timezone": "Asia/Kolkata",
-            "tts_speed": "1.00",
-            "server_interrupt_enabled": "true",
-            "client_aec": "true",
-            "client_platform": "web_claude_ai",
-            "entry_source": "chat_button",
-            "connect_reason": "initial",
-            "voice": self.voice,
-        }
-        if self.ephemeral:
-            params["chat_memory_mode"] = "disabled"
-        if self.model:
-            params["model"] = self.model
+            url = (
+                f"wss://claude.ai/api/ws/voice/organizations/{org_uuid}/"
+                f"chat_conversations/{self.conversation_uuid}?{urllib.parse.urlencode(params)}"
+            )
+            logger.info(f"Connecting to Claude Voice Mode WS: {url} via account '{acc_name}'")
 
-        url = (
-            f"wss://claude.ai/api/ws/voice/organizations/{org_uuid}/"
-            f"chat_conversations/{self.conversation_uuid}?{urllib.parse.urlencode(params)}"
-        )
-        logger.info(f"Connecting to Claude Voice Mode WS: {url} (suppress_reply={self.suppress_reply})")
+            self._session = aiohttp.ClientSession()
+            try:
+                self._ws = await self._session.ws_connect(url, headers=headers, heartbeat=20.0)
+                self._is_closed = False
+                self._interrupted = False
+                self._history_utterances = []
+                self._current_turn_text = ""
+                self._accumulated_text = ""
+                self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+                logger.info(f"Connected to Claude Voice Mode WebSocket successfully via '{acc_name}'!")
+                return
+            except aiohttp.WSServerHandshakeError as e:
+                if self._session:
+                    await self._session.close()
+                if e.status == 429:
+                    account_pool.mark_rate_limited(acc_id, cooldown_seconds=900, reason="WS Handshake 429")
+                elif e.status in (401, 403):
+                    account_pool.mark_dead(acc_id, reason=f"WS Handshake {e.status}")
+                else:
+                    logger.error(f"WS handshake failed for '{acc_name}': {e}")
+                last_error = e
+            except Exception as e:
+                if self._session:
+                    await self._session.close()
+                err_str = str(e).lower()
+                if "429" in err_str:
+                    account_pool.mark_rate_limited(acc_id, cooldown_seconds=900, reason=str(e))
+                elif "401" in err_str or "403" in err_str:
+                    account_pool.mark_dead(acc_id, reason=str(e))
+                else:
+                    logger.error(f"Connection failed for '{acc_name}': {e}")
+                last_error = e
 
-        self._session = aiohttp.ClientSession()
-        try:
-            self._ws = await self._session.ws_connect(url, headers=headers, heartbeat=20.0)
-            self._is_closed = False
-            self._interrupted = False
-            self._history_utterances = []
-            self._current_turn_text = ""
-            self._accumulated_text = ""
-            self._keepalive_task = asyncio.create_task(self._keepalive_loop())
-            logger.info("Connected to Claude Voice Mode WebSocket.")
-        except Exception as e:
-            if self._session:
-                await self._session.close()
-            raise RuntimeError(f"Failed to connect to Claude Voice Mode: {e}")
+        raise RuntimeError(f"Failed to connect to Claude Voice Mode after trying {len(tried_ids)} accounts: {last_error}")
 
     async def _keepalive_loop(self):
-        """Send periodic keep_alive control frames."""
+        """Send periodic keep-alive / ping frames."""
         try:
             while not self._is_closed and self._ws and not self._ws.closed:
-                await asyncio.sleep(4.0)
+                await asyncio.sleep(5.0)
                 if not self._is_closed and self._ws and not self._ws.closed:
                     await self._ws.send_str(json.dumps({"type": "keep_alive"}))
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.debug(f"Voice keepalive error: {e}")
+            logger.debug(f"Keepalive loop stopped: {e}")
 
-    async def send_audio(self, chunk: bytes):
-        """Send raw audio chunk (16kHz 16-bit mono PCM)."""
+    async def send_audio_chunk(self, pcm_chunk: bytes):
+        """Send raw PCM linear16 16kHz audio chunk to Claude."""
         if self._ws and not self._ws.closed:
-            await self._ws.send_bytes(chunk)
-        else:
-            raise RuntimeError("Cannot send audio: WebSocket closed")
+            await self._ws.send_bytes(pcm_chunk)
 
     async def send_interrupt(self):
-        """Interrupt current assistant playback / generation."""
+        """Send interrupt signal to Claude to stop audio generation immediately."""
         if self._ws and not self._ws.closed:
+            await self._ws.send_str(
+                json.dumps(
+                    {
+                        "type": "interrupt",
+                        "reason": "user_speech_detected",
+                    }
+                )
+            )
             self._interrupted = True
-            await self._ws.send_str(json.dumps({"type": "interrupt"}))
 
-    async def receive_events(self) -> AsyncGenerator[Dict[str, Any], None]:
-        """Yield structured conversation events (user prompt updates & assistant text).
+    async def flush_and_finish_turn(self):
+        """Send silence padding and VAD signals so Claude finalizes the current utterance."""
+        if not self._ws or self._ws.closed:
+            return
 
-        Maintains cumulative prompt history so speech across pauses is never lost.
+        # Send 0.4s silence to guarantee VAD triggers end-of-speech
+        silence_chunk = b"\x00\x00" * int(self.sample_rate * 0.4)
+        await self._ws.send_bytes(silence_chunk)
+
+        try:
+            await self._ws.send_str(json.dumps({"type": "vad_speech_ended"}))
+            await self._ws.send_str(json.dumps({"type": "stop_audio"}))
+        except Exception:
+            pass
+
+    async def events(self) -> AsyncGenerator[Dict[str, Any], None]:
+        """Yield parsed events from Claude Voice WebSocket.
+
+        Intercepts:
+        - prompt_delta: Real-time user transcription chunk.
+        - prompt: Updated accumulated user prompt.
+        - assistant_audio / assistant_text: Claude's response (suppressed if suppress_reply=True).
         """
         if not self._ws:
-            raise RuntimeError("Session not connected")
+            raise RuntimeError("WebSocket not connected. Call connect() first.")
 
         try:
             async for msg in self._ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
-                    try:
-                        data = json.loads(msg.data)
-                    except Exception:
-                        continue
+                    data = json.loads(msg.data)
+                    event_type = data.get("type", "")
 
-                    mtype = data.get("type")
-
-                    # Live user speech prompt as spoken
-                    if mtype == "transcript_interim":
-                        text = data.get("text", "")
-                        self._current_turn_text = text
-                        full_prompt = self.accumulated_text
-                        self._accumulated_text = full_prompt
-                        yield {
-                            "type": "interim" if self.suppress_reply else "user_interim",
-                            "text": full_prompt,
-                            "turn_text": text,
-                            "conversation_uuid": self.conversation_uuid,
-                        }
-
-                    # User stopped speaking a turn
-                    elif mtype == "user_input_end":
-                        if self.suppress_reply:
-                            # Immediately tell server to interrupt and NOT generate an answer
-                            await self.send_interrupt()
-                        full_prompt = self.accumulated_text
-                        self._accumulated_text = full_prompt
-                        yield {
-                            "type": "interim" if self.suppress_reply else "user_speech_end",
-                            "text": full_prompt,
-                            "final_prompt": full_prompt,
-                            "conversation_uuid": self.conversation_uuid,
-                        }
-
-                    # Human message committed
-                    elif mtype == "message_complete":
-                        data_payload = data.get("data", {})
-                        if data_payload.get("sender") == "human":
-                            contents = data_payload.get("content", [])
-                            turn_text = ""
-                            if contents and isinstance(contents, list) and isinstance(contents[0], dict):
-                                turn_text = contents[0].get("text", "")
-                            if not turn_text:
-                                turn_text = data_payload.get("text", "") or self._current_turn_text
-
-                            if turn_text:
-                                self._history_utterances.append(turn_text.strip())
-                                self._current_turn_text = ""
-
-                            full_prompt = self.accumulated_text
-                            self._accumulated_text = full_prompt
+                    # 1. User Prompt Updates (The speech-to-text output)
+                    if event_type in ("transcript_interim", "prompt_delta", "prompt"):
+                        txt = data.get("text", "")
+                        if txt:
+                            self._current_turn_text = txt
+                            self._accumulated_text = self.accumulated_text
                             yield {
-                                "type": "final" if self.suppress_reply else "message_complete",
-                                "text": full_prompt,
-                                "sender": "human",
-                                "conversation_uuid": self.conversation_uuid,
+                                "type": "interim",
+                                "text": self._accumulated_text,
+                                "delta": txt,
+                                "full_text": self._accumulated_text,
+                            }
+
+                    # 2. Assistant Turn Starting -> We suppress the reply!
+                    elif (
+                        event_type in ("assistant_audio", "assistant_delta", "turn_start", "tts_word", "playback_end")
+                        or (event_type == "message_sse" and data.get("event", {}).get("type") in ("message_start", "content_block_start"))
+                    ):
+                        # If a turn just finished, archive the current turn text into history
+                        if self._current_turn_text.strip():
+                            curr = self._current_turn_text.strip()
+                            if not self._history_utterances or self._history_utterances[-1] != curr:
+                                self._history_utterances.append(curr)
+                            self._current_turn_text = ""
+
+                        if self.suppress_reply:
+                            # Immediately interrupt Claude so it doesn't speak or generate audio
+                            await self.send_interrupt()
+                            yield {
+                                "type": "final",
+                                "text": self.accumulated_text,
+                                "full_text": self.accumulated_text,
                             }
                         else:
-                            if not self.suppress_reply:
-                                yield {
-                                    "type": "message_complete",
-                                    "sender": data_payload.get("sender"),
-                                    "text": data_payload.get("text"),
-                                    "conversation_uuid": self.conversation_uuid,
-                                }
+                            yield data
 
-                    # Assistant text generation token by token
-                    elif mtype == "message_sse":
-                        if self.suppress_reply:
-                            # If server started generating before interrupt processed, send another interrupt
-                            if not self._interrupted:
-                                await self.send_interrupt()
-                            continue
+                    elif event_type == "error":
+                        err_msg = data.get("message", "Unknown error")
+                        logger.error(f"Claude Voice error event: {data}")
+                        if "rate limit" in err_msg.lower() or "429" in err_msg:
+                            if self.account:
+                                account_pool.mark_rate_limited(self.account["id"], cooldown_seconds=900, reason=err_msg)
+                        yield {"type": "error", "error": err_msg}
 
-                        ev = data.get("event", {})
-                        if ev.get("type") == "content_block_delta":
-                            delta = ev.get("data", {}).get("delta", {})
-                            token = delta.get("text", "")
-                            if token:
-                                yield {
-                                    "type": "assistant_text_delta",
-                                    "text": token,
-                                    "conversation_uuid": self.conversation_uuid,
-                                }
-
-                    elif mtype == "tts_word":
-                        if not self.suppress_reply:
-                            yield {
-                                "type": "tts_word",
-                                "text": data.get("text", ""),
-                                "pts_ms": data.get("pts_ms"),
-                            }
-
-                    elif mtype in ("playback_start", "playback_end"):
-                        if not self.suppress_reply:
-                            yield {"type": mtype}
-
-                    elif mtype == "error":
-                        yield {"type": "error", "error": data}
+                    else:
+                        yield data
 
                 elif msg.type == aiohttp.WSMsgType.BINARY:
-                    # Assistant PCM audio chunk
                     if not self.suppress_reply:
-                        yield {
-                            "type": "assistant_audio",
-                            "audio": msg.data,
-                        }
+                        yield {"type": "audio", "data": msg.data}
 
-                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
                     break
-        except asyncio.CancelledError:
-            pass
+
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    logger.error(f"WebSocket error: {self._ws.exception()}")
+                    break
+
+        except Exception as e:
+            logger.error(f"Exception in voice event loop: {e}")
+            raise
         finally:
-            await self.close()
+            # Mark account success if transcript was acquired
+            if self.account and self.accumulated_text.strip():
+                account_pool.mark_success(self.account["id"])
 
     async def close(self):
-        if self._is_closed:
-            return
+        """Clean up WebSocket and session resources."""
         self._is_closed = True
-
         if self._keepalive_task:
             self._keepalive_task.cancel()
-            try:
-                await self._keepalive_task
-            except asyncio.CancelledError:
-                pass
-            self._keepalive_task = None
 
         if self._ws and not self._ws.closed:
-            if self.suppress_reply and not self._interrupted:
+            if self.suppress_reply:
                 try:
                     await self._ws.send_str(json.dumps({"type": "interrupt"}))
                 except Exception:
@@ -355,11 +381,23 @@ class ClaudeVoiceSession:
     async def _cleanup_conversation(self):
         """Delete ephemeral conversation from Claude backend."""
         try:
-            _, _, org_uuid = auth_manager.get_credentials()
-            headers = auth_manager.get_headers()
+            if not self.account:
+                return
+            org_uuid = self.account.get("orgUuid", "")
+            session_key = self.account.get("sessionKey", "")
+            headers = {
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                "Cookie": f"sessionKey={session_key}; lastActiveOrg={org_uuid}",
+                "Origin": "https://claude.ai",
+                "Referer": "https://claude.ai/new",
+            }
             url = f"https://claude.ai/api/organizations/{org_uuid}/chat_conversations/{self.conversation_uuid}"
             async with aiohttp.ClientSession() as s:
                 async with s.delete(url, headers=headers, timeout=10) as resp:
                     logger.debug(f"Cleanup conversation {self.conversation_uuid}: status {resp.status}")
         except Exception as e:
-            logger.debug(f"Cleanup conversation failed (ignored): {e}")
+            logger.debug(f"Cleanup conversation ignored: {e}")
+
+    # Aliases for backward compatibility
+    send_audio = send_audio_chunk
+    receive_events = events
