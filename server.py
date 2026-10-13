@@ -14,7 +14,11 @@ Endpoints:
 3. Raw Dictation SST (/ws/sst or /ws):
    - Direct Deepgram Nova-3 dictation stream
 
-4. OpenAI-Compatible REST API (POST /v1/audio/transcriptions)
+4. OpenAI & Sarvam Compatible REST API:
+   - POST /v1/audio/transcriptions
+   - POST /speech-to-text
+   - POST /transcribe
+   - Keeps transcription in memory and returns complete JSON response (text, transcript, transcription)
 
 5. Interactive Web UI (GET /)
 """
@@ -318,20 +322,25 @@ HTML_INDEX = """<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <div class="card-title">WebSocket Endpoints</div>
+      <div class="card-title">WebSocket & REST Endpoints</div>
       <div class="code-snippet">
-# 1. Smart Conversational SST (Real-time dynamic prompt updates &bull; No Claude answer &bull; Ephemeral):<br>
-ws://localhost:8000/ws/conversational_sst<br>
+# 1. Non-streaming REST API (OpenAI & Sarvam compatible, returns complete response in memory):<br>
+POST http://127.0.0.1:8790/v1/audio/transcriptions (or /speech-to-text)<br>
+Returns: {"text": "...", "transcript": "...", "transcription": "..."}
+      </div>
+      <div class="code-snippet">
+# 2. Smart Conversational SST WebSocket (Real-time dynamic prompt updates &bull; No Claude answer):<br>
+ws://127.0.0.1:8790/ws/conversational_sst<br>
 Stream 16kHz PCM &rarr; Receive {"type": "interim", "text": "..."} &amp; {"type": "final", "text": "..."}
       </div>
       <div class="code-snippet">
-# 2. Full Conversational Audio Mode (Claude answers in context):<br>
-ws://localhost:8000/ws/voice?conversation_uuid=&lt;uuid&gt;<br>
+# 3. Full Conversational Audio Mode WebSocket (Claude answers in context):<br>
+ws://127.0.0.1:8790/ws/voice?conversation_uuid=&lt;uuid&gt;<br>
 Stream 16kHz PCM &rarr; Receive {"type": "user_interim", ...} &amp; {"type": "assistant_text_delta", ...}
       </div>
       <div class="code-snippet">
-# 3. Raw Dictation SST (Deepgram Nova-3):<br>
-ws://localhost:8000/ws/sst (or /ws)<br>
+# 4. Raw Dictation SST WebSocket (Deepgram Nova-3):<br>
+ws://127.0.0.1:8790/ws/sst (or /ws)<br>
 Stream 16kHz PCM &rarr; Receive {"type": "final", "text": "..."}
       </div>
     </div>
@@ -796,9 +805,12 @@ async def handle_ws_sst(request: web.Request) -> web.WebSocketResponse:
 
 
 # =====================================================================
-# REST: OpenAI-Compatible Transcriptions (POST /v1/audio/transcriptions)
+# REST: Non-Streaming Transcription API (OpenAI & Sarvam Compatible)
+# Keeps entire output in memory and returns as one complete JSON response
 # =====================================================================
 @routes.post("/v1/audio/transcriptions")
+@routes.post("/speech-to-text")
+@routes.post("/transcribe")
 async def handle_transcriptions(request: web.Request) -> web.Response:
     reader = await request.multipart()
     audio_bytes = None
@@ -811,15 +823,21 @@ async def handle_transcriptions(request: web.Request) -> web.Response:
             break
         if field.name in ("file", "audio"):
             audio_bytes = await field.read()
-        elif field.name == "language":
-            language = (await field.read()).decode("utf-8").strip()
-        elif field.name == "engine":
-            engine = (await field.read()).decode("utf-8").strip()
+        elif field.name in ("language", "language_code"):
+            val = (await field.read()).decode("utf-8", errors="ignore").strip()
+            if val and val != "unknown":
+                language = val
+        elif field.name in ("engine", "model"):
+            val = (await field.read()).decode("utf-8", errors="ignore").strip()
+            if val:
+                engine = val
+        else:
+            await field.read()
 
     if not audio_bytes:
         return web.json_response({"error": "No audio file provided in request"}, status=400)
 
-    # Transcode audio to 16kHz 16-bit mono PCM via ffmpeg
+    # Transcode incoming audio (WAV, MP3, OGG, WebM, etc.) to 16kHz 16-bit mono PCM via ffmpeg
     try:
         proc = subprocess.Popen(
             [
@@ -835,7 +853,7 @@ async def handle_transcriptions(request: web.Request) -> web.Response:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        pcm_data, err = proc.communicate(input=audio_bytes, timeout=30)
+        pcm_data, err = proc.communicate(input=audio_bytes, timeout=45)
         if proc.returncode != 0:
             logger.error(f"FFmpeg error: {err.decode('utf-8', errors='ignore')}")
             return web.json_response({"error": "Audio transcoding failed"}, status=400)
@@ -845,36 +863,8 @@ async def handle_transcriptions(request: web.Request) -> web.Response:
 
     final_text = ""
 
-    if engine == "conversational":
-        voice_session = ClaudeVoiceSession(language=language, suppress_reply=True, ephemeral=True)
-        try:
-            await voice_session.connect()
-
-            async def send_audio():
-                chunk_size = 3200
-                for i in range(0, len(pcm_data), chunk_size):
-                    await voice_session.send_audio(pcm_data[i:i+chunk_size])
-                    await asyncio.sleep(0.04)
-                for _ in range(12):
-                    await voice_session.send_audio(b"\x00" * 3200)
-                    await asyncio.sleep(0.04)
-                await voice_session.send_interrupt()
-                await asyncio.sleep(0.5)
-                await voice_session.close()
-
-            sender = asyncio.create_task(send_audio())
-            async for event in voice_session.receive_events():
-                if event.get("type") in ("final", "interim"):
-                    txt = event.get("text", "")
-                    if txt:
-                        final_text = txt
-            await sender
-        except Exception as e:
-            logger.error(f"Error during conversational transcription: {e}")
-            return web.json_response({"error": str(e)}, status=500)
-        finally:
-            await voice_session.close()
-    else:
+    # Choose between conversational engine and raw dictation engine
+    if engine in ("sst", "dictation", "nova", "nova-3", "deepgram"):
         claude_session = ClaudeSSTSession(language=language)
         try:
             await claude_session.connect()
@@ -883,11 +873,11 @@ async def handle_transcriptions(request: web.Request) -> web.Response:
                 chunk_size = 3200
                 for i in range(0, len(pcm_data), chunk_size):
                     await claude_session.send_audio(pcm_data[i:i+chunk_size])
-                    await asyncio.sleep(0.04)
-                for _ in range(12):
+                    await asyncio.sleep(0.02)
+                for _ in range(8):
                     await claude_session.send_audio(b"\x00" * 3200)
-                    await asyncio.sleep(0.04)
-                await asyncio.sleep(0.8)
+                    await asyncio.sleep(0.02)
+                await asyncio.sleep(0.5)
                 await claude_session.close()
 
             sender = asyncio.create_task(send_audio_chunks())
@@ -902,8 +892,54 @@ async def handle_transcriptions(request: web.Request) -> web.Response:
             return web.json_response({"error": str(e)}, status=500)
         finally:
             await claude_session.close()
+    else:
+        # Default: Smart Conversational Engine (context-aware prompt builder, no Claude reply)
+        voice_session = ClaudeVoiceSession(language=language, suppress_reply=True, ephemeral=True)
+        try:
+            await voice_session.connect()
+            got_final = asyncio.Event()
 
-    return web.json_response({"text": final_text})
+            async def send_audio():
+                chunk_size = 3200
+                for i in range(0, len(pcm_data), chunk_size):
+                    await voice_session.send_audio(pcm_data[i:i+chunk_size])
+                    await asyncio.sleep(0.02)
+                # Send silence frames to trigger turn completion
+                for _ in range(10):
+                    await voice_session.send_audio(b"\x00" * 3200)
+                    await asyncio.sleep(0.02)
+                try:
+                    await asyncio.wait_for(got_final.wait(), timeout=2.5)
+                except asyncio.TimeoutError:
+                    pass
+                await voice_session.send_interrupt()
+                await asyncio.sleep(0.2)
+                await voice_session.close()
+
+            sender = asyncio.create_task(send_audio())
+            async for event in voice_session.receive_events():
+                if event.get("type") in ("final", "interim"):
+                    txt = event.get("text", "")
+                    if txt:
+                        final_text = txt
+                if event.get("type") == "final" and len(final_text) > 10:
+                    got_final.set()
+            await sender
+        except Exception as e:
+            logger.error(f"Error during conversational transcription: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+        finally:
+            await voice_session.close()
+
+    final_text = final_text.strip()
+    logger.info(f"Completed non-streaming transcription ({len(final_text)} chars): {final_text[:60]}...")
+
+    # Return universal response compatible with OpenAI, Sarvam, and generic clients
+    return web.json_response({
+        "text": final_text,
+        "transcript": final_text,
+        "transcription": final_text,
+    })
 
 
 def create_app() -> web.Application:
@@ -914,6 +950,7 @@ def create_app() -> web.Application:
 
 if __name__ == "__main__":
     app = create_app()
-    port = int(os.getenv("PORT", "8000"))
-    logger.info(f"Starting Claude Audio & SST Proxy on http://127.0.0.1:{port}")
-    web.run_app(app, host="127.0.0.1", port=port)
+    port = int(os.getenv("PORT", "8790"))
+    host = os.getenv("HOST", "127.0.0.1")
+    logger.info(f"Starting Claude Audio & SST Proxy on http://{host}:{port}")
+    web.run_app(app, host=host, port=port)
