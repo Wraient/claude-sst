@@ -122,13 +122,56 @@ async def test_raw_sst_streaming():
             assert received_text, "Did not receive dictation SST text"
 
 
+async def test_openai_realtime_streaming():
+    print("\n=== 5. OpenAI Realtime WebSocket (/v1/realtime) Live Streaming ===")
+    import base64
+    import subprocess
+    proc = subprocess.Popen(
+        ["ffmpeg", "-i", TEST_AUDIO, "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "24000", "-ac", "1", "pipe:1"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    pcm_24k, _ = proc.communicate()
+
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect("http://127.0.0.1:8790/v1/realtime") as ws:
+            print("Connected to OpenAI Realtime WebSocket")
+            await ws.send_str(json.dumps({"type": "input_audio_buffer.clear"}))
+
+            # Stream audio in 100ms chunks (24000Hz * 2 bytes * 0.1s = 4800 bytes)
+            chunk_size = 4800
+            for i in range(0, len(pcm_24k), chunk_size):
+                b64 = base64.b64encode(pcm_24k[i:i+chunk_size]).decode('utf-8')
+                await ws.send_str(json.dumps({"type": "input_audio_buffer.append", "audio": b64}))
+                await asyncio.sleep(0.05)
+
+            # Commit audio buffer
+            await ws.send_str(json.dumps({"type": "input_audio_buffer.commit"}))
+
+            final_text = None
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    mtype = data.get("type")
+                    if mtype == "conversation.item.input_audio_transcription.completed":
+                        final_text = data.get("transcript")
+                        print(f"[REALTIME COMPLETED] -> {final_text}")
+                        break
+                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
+                    break
+
+            assert final_text, "Did not receive completed transcript from realtime websocket"
+            print("Verified: OpenAI Realtime streaming transcript ready immediately on commit!")
+
 async def main():
     test_health()
     test_rest_transcription()
     await test_smart_sst_streaming()
     await test_raw_sst_streaming()
+    await test_openai_realtime_streaming()
     print("\nAll automated tests passed successfully!")
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+

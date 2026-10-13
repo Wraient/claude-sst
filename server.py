@@ -25,10 +25,13 @@ Endpoints:
 
 import os
 import json
+import uuid
+import base64
 import logging
 import asyncio
 import subprocess
 from typing import Optional
+import numpy as np
 from aiohttp import web
 
 from auth import auth_manager
@@ -801,6 +804,161 @@ async def handle_ws_sst(request: web.Request) -> web.WebSocketResponse:
         await ws.close()
 
     logger.info("SST streaming session finished.")
+    return ws
+
+
+# =====================================================================
+# WebSocket 4: OpenAI Realtime Compatible API (/v1/realtime, /realtime)
+# Streams mic audio in real time as the user speaks, delivering instant transcript on commit
+# =====================================================================
+@routes.get("/v1/realtime")
+@routes.get("/realtime")
+async def handle_ws_realtime(request: web.Request) -> web.WebSocketResponse:
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+
+    language = request.query.get("language", "en")
+    logger.info("Client connected to Realtime WebSocket (/v1/realtime)")
+
+    voice_session: Optional[ClaudeVoiceSession] = None
+    receiver_task: Optional[asyncio.Task] = None
+    last_partial = ""
+    lock = asyncio.Lock()
+
+    async def ensure_voice_session():
+        nonlocal voice_session, receiver_task, last_partial
+        if voice_session and not voice_session._is_closed:
+            return voice_session
+        voice_session = ClaudeVoiceSession(
+            language=language,
+            suppress_reply=True,
+            ephemeral=True,
+        )
+        await voice_session.connect()
+        last_partial = ""
+
+        async def receive_events_loop():
+            nonlocal last_partial
+            try:
+                async for event in voice_session.receive_events():
+                    if ws.closed:
+                        break
+                    if event.get("type") in ("interim", "user_interim"):
+                        current_full = event.get("text", "")
+                        if current_full:
+                            if current_full.startswith(last_partial):
+                                delta = current_full[len(last_partial):]
+                            else:
+                                delta = " " + current_full
+                            last_partial = current_full
+                            if delta:
+                                await ws.send_json({
+                                    "type": "conversation.item.input_audio_transcription.delta",
+                                    "delta": delta,
+                                })
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.debug(f"Realtime receiver loop error: {e}")
+
+        receiver_task = asyncio.create_task(receive_events_loop())
+        return voice_session
+
+    async def close_voice_session():
+        nonlocal voice_session, receiver_task
+        if receiver_task:
+            receiver_task.cancel()
+            try:
+                await receiver_task
+            except asyncio.CancelledError:
+                pass
+            receiver_task = None
+        if voice_session:
+            await voice_session.close()
+            voice_session = None
+
+    try:
+        session_id = str(uuid.uuid4())
+        await ws.send_json({
+            "type": "session.created",
+            "session": {
+                "id": session_id,
+                "model": "claude-voice-conversational",
+            }
+        })
+
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                try:
+                    data = json.loads(msg.data)
+                except Exception:
+                    continue
+
+                mtype = data.get("type")
+
+                if mtype == "session.update":
+                    sess = data.get("session", {})
+                    audio_trans = sess.get("audio", {}).get("input", {}).get("transcription", {})
+                    if audio_trans.get("language"):
+                        language = audio_trans["language"]
+                    await ws.send_json({
+                        "type": "session.updated",
+                        "session": sess,
+                    })
+
+                elif mtype == "input_audio_buffer.clear":
+                    async with lock:
+                        await close_voice_session()
+                        await ensure_voice_session()
+                    await ws.send_json({"type": "input_audio_buffer.cleared"})
+
+                elif mtype == "input_audio_buffer.append":
+                    b64_audio = data.get("audio", "")
+                    if b64_audio:
+                        raw_bytes = base64.b64decode(b64_audio)
+                        if raw_bytes:
+                            # Hyprwhspr sends 24kHz 16-bit mono PCM. Resample to 16kHz PCM for Claude.
+                            pcm_in = np.frombuffer(raw_bytes, dtype=np.int16)
+                            if len(pcm_in) > 0:
+                                out_len = int(len(pcm_in) * 16000 / 24000)
+                                if out_len > 0:
+                                    orig_indices = np.linspace(0, len(pcm_in) - 1, out_len, endpoint=False)
+                                    pcm_16k = np.interp(orig_indices, np.arange(len(pcm_in)), pcm_in).astype(np.int16).tobytes()
+                                    async with lock:
+                                        curr_session = await ensure_voice_session()
+                                        await curr_session.send_audio(pcm_16k)
+
+                elif mtype == "input_audio_buffer.commit":
+                    # Mic released / recording stopped!
+                    async with lock:
+                        if voice_session and not voice_session._is_closed:
+                            for _ in range(4):
+                                await voice_session.send_audio(bytes(3200))
+                                await asyncio.sleep(0.01)
+                            await asyncio.sleep(0.12)
+                            await voice_session.send_interrupt()
+
+                            final_transcript = voice_session.accumulated_text
+                        else:
+                            final_transcript = ""
+
+                    await ws.send_json({"type": "input_audio_buffer.committed"})
+                    await ws.send_json({
+                        "type": "conversation.item.input_audio_transcription.completed",
+                        "transcript": final_transcript,
+                    })
+                    logger.info(f"Realtime transcription committed ({len(final_transcript)} chars): {final_transcript[:80]}")
+
+            elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
+                break
+    except Exception as e:
+        logger.error(f"Realtime WebSocket handler error: {e}")
+    finally:
+        await close_voice_session()
+        if not ws.closed:
+            await ws.close()
+        logger.info("Realtime WebSocket connection closed.")
+
     return ws
 
 
