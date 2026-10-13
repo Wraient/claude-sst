@@ -1083,15 +1083,15 @@ async def handle_ws_realtime(request: web.Request) -> web.WebSocketResponse:
                     # Mic released / recording stopped!
                     async with lock:
                         if voice_session and not voice_session._is_closed:
-                            for _ in range(4):
-                                await voice_session.send_audio(bytes(3200))
-                                await asyncio.sleep(0.01)
-
-                            # If text has not arrived yet (e.g. fast streaming test), wait up to 2 seconds
-                            for _ in range(25):
-                                if voice_session.accumulated_text.strip():
-                                    break
-                                await asyncio.sleep(0.08)
+                            # 1. Flush turn with silence padding and VAD signals
+                            await voice_session.flush_and_finish_turn()
+                            # 2. Wait up to 1.5s for Claude to finish processing turn
+                            try:
+                                await asyncio.wait_for(voice_session.turn_completed_event.wait(), timeout=1.4)
+                            except asyncio.TimeoutError:
+                                pass
+                            # Small 100ms grace period for final interim event text aggregation
+                            await asyncio.sleep(0.1)
 
                             await voice_session.send_interrupt()
                             final_transcript = voice_session.accumulated_text
@@ -1236,11 +1236,21 @@ async def handle_transcriptions(request: web.Request) -> web.Response:
             receiver = asyncio.create_task(receive())
 
             await finished_sending.wait()
-            # Allow Claude to finalize the last utterance
-            await asyncio.sleep(1.2)
+            # Allow Claude to finalize the trailing speech
+            last_text = voice_session.accumulated_text
+            unchanged = 0
+            for _ in range(16):
+                await asyncio.sleep(0.05)
+                curr = voice_session.accumulated_text
+                if curr == last_text and curr.strip():
+                    unchanged += 1
+                    if unchanged >= 6:
+                        break
+                else:
+                    unchanged = 0
+                    last_text = curr
             await voice_session.send_interrupt()
             receiver.cancel()
-
             final_text = voice_session.accumulated_text
         except Exception as e:
             logger.error(f"Error during conversational transcription: {e}")

@@ -129,6 +129,7 @@ class ClaudeVoiceSession:
         self._history_utterances: List[str] = []
         self._current_turn_text: str = ""
         self._accumulated_text: str = ""
+        self.turn_completed_event = asyncio.Event()
 
     @property
     def accumulated_text(self) -> str:
@@ -143,6 +144,7 @@ class ClaudeVoiceSession:
 
         while attempt < max_retries:
             attempt += 1
+            self.conversation_uuid = str(uuid.uuid4())
             if not self.account or self.account["id"] in tried_ids:
                 try:
                     self.account = account_pool.get_next_account(exclude_ids=tried_ids)
@@ -273,6 +275,7 @@ class ClaudeVoiceSession:
     async def send_audio_chunk(self, pcm_chunk: bytes):
         """Send raw PCM linear16 16kHz audio chunk to Claude after stripping DC offset."""
         if self._ws and not self._ws.closed:
+            self.turn_completed_event.clear()
             cleaned = self._dc_blocker.process_bytes(pcm_chunk)
             await self._ws.send_bytes(cleaned)
 
@@ -293,6 +296,7 @@ class ClaudeVoiceSession:
         """Send silence padding and VAD signals so Claude finalizes the current utterance."""
         if not self._ws or self._ws.closed:
             return
+        self.turn_completed_event.clear()
 
         # Send 0.4s silence to guarantee VAD triggers end-of-speech
         silence_chunk = b"\x00\x00" * int(self.sample_rate * 0.4)
@@ -364,6 +368,7 @@ class ClaudeVoiceSession:
                         event_type in ("assistant_audio", "assistant_delta", "turn_start", "tts_word", "playback_end", "user_input_end")
                         or (event_type == "message_sse" and data.get("event", {}).get("type") in ("message_start", "content_block_start"))
                     ):
+                        self.turn_completed_event.set()
                         # Archive current turn text into history
                         if self._current_turn_text.strip():
                             curr = self._current_turn_text.strip()
