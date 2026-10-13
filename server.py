@@ -893,38 +893,41 @@ async def handle_transcriptions(request: web.Request) -> web.Response:
         finally:
             await claude_session.close()
     else:
-        # Default: Smart Conversational Engine (context-aware prompt builder, no Claude reply)
+        # Default: Smart Conversational Engine (context-aware prompt builder across all pauses)
         voice_session = ClaudeVoiceSession(language=language, suppress_reply=True, ephemeral=True)
         try:
             await voice_session.connect()
-            got_final = asyncio.Event()
+            finished_sending = asyncio.Event()
 
             async def send_audio():
                 chunk_size = 3200
                 for i in range(0, len(pcm_data), chunk_size):
                     await voice_session.send_audio(pcm_data[i:i+chunk_size])
                     await asyncio.sleep(0.02)
-                # Send silence frames to trigger turn completion
-                for _ in range(10):
+                # Send silence frames to trigger turn completion for the final utterance
+                for _ in range(16):
                     await voice_session.send_audio(b"\x00" * 3200)
                     await asyncio.sleep(0.02)
-                try:
-                    await asyncio.wait_for(got_final.wait(), timeout=2.5)
-                except asyncio.TimeoutError:
-                    pass
-                await voice_session.send_interrupt()
-                await asyncio.sleep(0.2)
-                await voice_session.close()
+                finished_sending.set()
 
             sender = asyncio.create_task(send_audio())
-            async for event in voice_session.receive_events():
-                if event.get("type") in ("final", "interim"):
-                    txt = event.get("text", "")
-                    if txt:
-                        final_text = txt
-                if event.get("type") == "final" and len(final_text) > 10:
-                    got_final.set()
-            await sender
+
+            async def receive():
+                try:
+                    async for event in voice_session.receive_events():
+                        pass
+                except asyncio.CancelledError:
+                    pass
+
+            receiver = asyncio.create_task(receive())
+
+            await finished_sending.wait()
+            # Allow Claude to finalize the last utterance
+            await asyncio.sleep(1.2)
+            await voice_session.send_interrupt()
+            receiver.cancel()
+
+            final_text = voice_session.accumulated_text
         except Exception as e:
             logger.error(f"Error during conversational transcription: {e}")
             return web.json_response({"error": str(e)}, status=500)

@@ -11,12 +11,55 @@ import json
 import logging
 import urllib.parse
 import uuid
-from typing import AsyncGenerator, Dict, Any, Optional
+from typing import AsyncGenerator, Dict, Any, Optional, List
 import aiohttp
 
 from auth import auth_manager
 
 logger = logging.getLogger("claude_voice")
+
+
+def combine_transcripts(history: List[str], current: str) -> str:
+    """Seamlessly combine committed turn history and current live utterance,
+
+    avoiding duplicate overlapping boundary words across pauses and turns.
+    """
+    cleaned_history = [h.strip() for h in history if h and h.strip()]
+    cleaned_current = current.strip() if current else ""
+
+    if not cleaned_history:
+        return cleaned_current
+    if not cleaned_current:
+        return " ".join(cleaned_history)
+
+    full_history = " ".join(cleaned_history)
+
+    # If current already contains full_history
+    if cleaned_current.startswith(full_history):
+        return cleaned_current
+
+    # If current already contains the last turn
+    last_item = cleaned_history[-1]
+    if cleaned_current.startswith(last_item):
+        prefix = " ".join(cleaned_history[:-1])
+        return f"{prefix} {cleaned_current}".strip()
+
+    # Word-level suffix overlap check to eliminate duplicate boundary words
+    hist_words = full_history.split()
+    curr_words = cleaned_current.split()
+    max_overlap = min(len(hist_words), len(curr_words), 8)
+    overlap_len = 0
+    for k in range(max_overlap, 0, -1):
+        h_slice = [w.lower().strip(".,?!;:'\"") for w in hist_words[-k:]]
+        c_slice = [w.lower().strip(".,?!;:'\"") for w in curr_words[:k]]
+        if h_slice == c_slice:
+            overlap_len = k
+            break
+
+    if overlap_len > 0:
+        return " ".join(hist_words[:-overlap_len] + curr_words)
+
+    return f"{full_history} {cleaned_current}".strip()
 
 
 class ClaudeVoiceSession:
@@ -45,6 +88,16 @@ class ClaudeVoiceSession:
         self._keepalive_task: Optional[asyncio.Task] = None
         self._is_closed = False
         self._interrupted = False
+
+        # Accumulation state across pauses and multi-turn utterances
+        self._history_utterances: List[str] = []
+        self._current_turn_text: str = ""
+        self._accumulated_text: str = ""
+
+    @property
+    def accumulated_text(self) -> str:
+        """Returns the full accumulated transcript from the moment recording started."""
+        return combine_transcripts(self._history_utterances, self._current_turn_text)
 
     async def _ensure_conversation_exists(self):
         """Create conversation in Claude if it doesn't already exist."""
@@ -106,6 +159,9 @@ class ClaudeVoiceSession:
             self._ws = await self._session.ws_connect(url, headers=headers, heartbeat=20.0)
             self._is_closed = False
             self._interrupted = False
+            self._history_utterances = []
+            self._current_turn_text = ""
+            self._accumulated_text = ""
             self._keepalive_task = asyncio.create_task(self._keepalive_loop())
             logger.info("Connected to Claude Voice Mode WebSocket.")
         except Exception as e:
@@ -139,11 +195,13 @@ class ClaudeVoiceSession:
             await self._ws.send_str(json.dumps({"type": "interrupt"}))
 
     async def receive_events(self) -> AsyncGenerator[Dict[str, Any], None]:
-        """Yield structured conversation events (user prompt updates & assistant text)."""
+        """Yield structured conversation events (user prompt updates & assistant text).
+
+        Maintains cumulative prompt history so speech across pauses is never lost.
+        """
         if not self._ws:
             raise RuntimeError("Session not connected")
 
-        current_prompt = ""
         try:
             async for msg in self._ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
@@ -157,48 +215,61 @@ class ClaudeVoiceSession:
                     # Live user speech prompt as spoken
                     if mtype == "transcript_interim":
                         text = data.get("text", "")
-                        current_prompt = text
+                        self._current_turn_text = text
+                        full_prompt = self.accumulated_text
+                        self._accumulated_text = full_prompt
                         yield {
                             "type": "interim" if self.suppress_reply else "user_interim",
-                            "text": text,
+                            "text": full_prompt,
+                            "turn_text": text,
                             "conversation_uuid": self.conversation_uuid,
                         }
 
-                    # User stopped speaking turn
+                    # User stopped speaking a turn
                     elif mtype == "user_input_end":
                         if self.suppress_reply:
                             # Immediately tell server to interrupt and NOT generate an answer
                             await self.send_interrupt()
-                            yield {
-                                "type": "final",
-                                "text": current_prompt,
-                                "conversation_uuid": self.conversation_uuid,
-                            }
-                        else:
-                            yield {
-                                "type": "user_speech_end",
-                                "final_prompt": current_prompt,
-                                "conversation_uuid": self.conversation_uuid,
-                            }
+                        full_prompt = self.accumulated_text
+                        self._accumulated_text = full_prompt
+                        yield {
+                            "type": "interim" if self.suppress_reply else "user_speech_end",
+                            "text": full_prompt,
+                            "final_prompt": full_prompt,
+                            "conversation_uuid": self.conversation_uuid,
+                        }
 
                     # Human message committed
                     elif mtype == "message_complete":
-                        sender = data.get("data", {}).get("sender")
-                        text = data.get("data", {}).get("text")
-                        if self.suppress_reply:
-                            if sender == "human" and text:
-                                yield {
-                                    "type": "final",
-                                    "text": text,
-                                    "conversation_uuid": self.conversation_uuid,
-                                }
-                        else:
+                        data_payload = data.get("data", {})
+                        if data_payload.get("sender") == "human":
+                            contents = data_payload.get("content", [])
+                            turn_text = ""
+                            if contents and isinstance(contents, list) and isinstance(contents[0], dict):
+                                turn_text = contents[0].get("text", "")
+                            if not turn_text:
+                                turn_text = data_payload.get("text", "") or self._current_turn_text
+
+                            if turn_text:
+                                self._history_utterances.append(turn_text.strip())
+                                self._current_turn_text = ""
+
+                            full_prompt = self.accumulated_text
+                            self._accumulated_text = full_prompt
                             yield {
-                                "type": "message_complete",
-                                "sender": sender,
-                                "text": text,
+                                "type": "final" if self.suppress_reply else "message_complete",
+                                "text": full_prompt,
+                                "sender": "human",
                                 "conversation_uuid": self.conversation_uuid,
                             }
+                        else:
+                            if not self.suppress_reply:
+                                yield {
+                                    "type": "message_complete",
+                                    "sender": data_payload.get("sender"),
+                                    "text": data_payload.get("text"),
+                                    "conversation_uuid": self.conversation_uuid,
+                                }
 
                     # Assistant text generation token by token
                     elif mtype == "message_sse":
@@ -288,7 +359,7 @@ class ClaudeVoiceSession:
             headers = auth_manager.get_headers()
             url = f"https://claude.ai/api/organizations/{org_uuid}/chat_conversations/{self.conversation_uuid}"
             async with aiohttp.ClientSession() as s:
-                async with s.delete(url, headers=headers, timeout=5) as resp:
-                    logger.debug(f"Ephemeral conversation cleanup status: {resp.status}")
+                async with s.delete(url, headers=headers, timeout=10) as resp:
+                    logger.debug(f"Cleanup conversation {self.conversation_uuid}: status {resp.status}")
         except Exception as e:
-            logger.debug(f"Ephemeral cleanup note: {e}")
+            logger.debug(f"Cleanup conversation failed (ignored): {e}")
