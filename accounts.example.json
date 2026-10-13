@@ -1,0 +1,16 @@
+{
+  "accounts": [
+    {
+      "id": "account_example",
+      "name": "Claude Account Example",
+      "sessionKey": "sk-ant-sid02-YOUR_SESSION_KEY_HERE",
+      "orgUuid": "your-org-uuid-here",
+      "status": "active",
+      "rate_limited_until": 0,
+      "last_used": 0,
+      "usage_count": 0,
+      "error_count": 0,
+      "last_error": null
+    }
+  ]
+}
