@@ -1,16 +1,22 @@
 """Local Proxy Server for Claude Web Speech-to-Text (SST) & Conversational Audio Mode.
 
-Provides:
-1. Conversational Audio Mode WebSocket (/ws/voice or /v1/voice/stream):
-   - Updates prompt dynamically as spoken
-   - Maintains conversation context
-   - Streams Claude assistant text responses token by token
-   - Streams Claude audio responses
-2. Pure Dictation SST WebSocket (/ws/sst or /ws or /v1/audio/transcriptions/stream):
-   - Fast raw speech-to-text transcription without assistant replies
-3. OpenAI-Compatible REST API (POST /v1/audio/transcriptions)
-4. Interactive Web UI with Mode Switcher (GET /)
-5. Health Check (GET /health)
+Endpoints:
+1. Smart Conversational SST (/ws/conversational_sst or /ws/smart_sst):
+   - Uses Claude's Conversational Voice pipeline to update prompt contextually
+   - Suppresses Claude's assistant reply via instant interrupt
+   - Deletes ephemeral conversation cleanly (no stray chats)
+   - Output: Real-time updated prompt text without Claude answering
+
+2. Full Conversational Voice Mode (/ws/voice):
+   - Updates prompt dynamically
+   - Claude assistant answers in context (text tokens + audio)
+
+3. Raw Dictation SST (/ws/sst or /ws):
+   - Direct Deepgram Nova-3 dictation stream
+
+4. OpenAI-Compatible REST API (POST /v1/audio/transcriptions)
+
+5. Interactive Web UI (GET /)
 """
 
 import os
@@ -51,7 +57,7 @@ HTML_INDEX = """<!DOCTYPE html>
       --border: #32323a;
       --claude-accent: #d97757;
       --claude-accent-dark: #b85c3e;
-      --claude-purple: #9065b0;
+      --claude-blue: #3b82f6;
       --text: #f4f4f7;
       --text-muted: #8e8e99;
       --success: #22c55e;
@@ -68,7 +74,7 @@ HTML_INDEX = """<!DOCTYPE html>
       padding: 2rem 1rem;
     }
     .container {
-      max-width: 860px;
+      max-width: 900px;
       width: 100%;
     }
     header {
@@ -93,16 +99,17 @@ HTML_INDEX = """<!DOCTYPE html>
       display: flex;
       justify-content: center;
       margin: 1.25rem 0 1.75rem;
-      gap: 0.75rem;
+      gap: 0.5rem;
+      flex-wrap: wrap;
     }
     .mode-btn {
-      padding: 0.65rem 1.25rem;
+      padding: 0.65rem 1.1rem;
       border-radius: 8px;
       border: 1px solid var(--border);
       background: var(--card-bg);
       color: var(--text-muted);
       cursor: pointer;
-      font-size: 0.9rem;
+      font-size: 0.88rem;
       font-weight: 600;
       transition: all 0.2s;
     }
@@ -127,6 +134,14 @@ HTML_INDEX = """<!DOCTYPE html>
       display: flex;
       justify-content: space-between;
       align-items: center;
+    }
+    .mode-badge {
+      font-size: 0.75rem;
+      padding: 0.25rem 0.6rem;
+      border-radius: 12px;
+      background: rgba(217, 119, 87, 0.2);
+      color: var(--claude-accent);
+      border: 1px solid rgba(217, 119, 87, 0.3);
     }
     .mic-controls {
       display: flex;
@@ -231,7 +246,7 @@ HTML_INDEX = """<!DOCTYPE html>
       border-radius: 6px;
       padding: 0.75rem 1rem;
       font-family: monospace;
-      font-size: 0.85rem;
+      font-size: 0.82rem;
       color: #e4e4e7;
       overflow-x: auto;
       margin-top: 0.5rem;
@@ -242,22 +257,25 @@ HTML_INDEX = """<!DOCTYPE html>
   <div class="container">
     <header>
       <h1><span>Claude Audio</span> Local Gateway</h1>
-      <p class="subtitle">Conversational Voice Mode (Context + Live Prompts) &amp; Speech-to-Text</p>
+      <p class="subtitle">Conversational SST (Live Prompting), Full Voice Mode, &amp; Raw Dictation</p>
     </header>
 
     <div class="mode-selector">
-      <button class="mode-btn active" id="modeVoiceBtn" onclick="switchMode('voice')">
-        Conversational Audio Mode (Live Prompt &amp; Context)
+      <button class="mode-btn active" id="btnSmartSst" onclick="switchMode('smart_sst')">
+        &starf; Conversational SST (No Claude Answer)
       </button>
-      <button class="mode-btn" id="modeSstBtn" onclick="switchMode('sst')">
-        Pure Dictation SST (Transcribe Only)
+      <button class="mode-btn" id="btnVoice" onclick="switchMode('voice')">
+        Conversational Audio (Claude Answers)
+      </button>
+      <button class="mode-btn" id="btnSst" onclick="switchMode('sst')">
+        Raw Dictation SST (Deepgram Nova-3)
       </button>
     </div>
 
     <div class="card">
       <div class="card-title">
-        <span id="activeModeTitle">Conversational Audio Mode</span>
-        <span style="font-size: 0.8rem; color: var(--text-muted);">Real-time Bidirectional Stream</span>
+        <span id="activeModeTitle">Smart Conversational SST</span>
+        <span class="mode-badge" id="modeBadge">Dynamic Prompting &bull; No Answer</span>
       </div>
 
       <div class="mic-controls">
@@ -265,123 +283,120 @@ HTML_INDEX = """<!DOCTYPE html>
           <svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
         </button>
         <div id="statusText" class="status-text">Click microphone to speak</div>
-        <canvas id="viz" class="visualizer-canvas" height="40" width="800"></canvas>
+        <canvas id="viz" class="visualizer-canvas" height="40" width="850"></canvas>
       </div>
 
-      <!-- Conversational View -->
-      <div class="dual-pane" id="dualPane">
-        <div>
-          <div class="pane-header">
-            <span class="prompt-accent">Live Updated Prompt (Your Speech)</span>
-            <span id="promptStatus"></span>
-          </div>
-          <div id="promptBox" class="pane-box">Speak to watch your prompt update dynamically...</div>
-        </div>
-        <div>
-          <div class="pane-header">
-            <span class="claude-accent">Claude Response (In Context)</span>
-            <span id="claudeStatus"></span>
-          </div>
-          <div id="claudeBox" class="pane-box">Claude's streamed response will appear here...</div>
-        </div>
-      </div>
-
-      <!-- Pure SST View (Hidden in voice mode) -->
-      <div id="sstPane" style="display: none;">
+      <!-- Single Prompt View (Smart SST & Raw SST) -->
+      <div id="singlePane">
         <div class="pane-header">
-          <span class="prompt-accent">Transcript (Speech-to-Text)</span>
+          <span class="prompt-accent" id="singlePaneTitle">Live Conversational Prompt</span>
+          <span id="singleStatus"></span>
         </div>
-        <div id="sstBox" class="pane-box">Transcription will appear here as you speak...</div>
+        <div id="singleBox" class="pane-box">Speak to watch your prompt update dynamically in real time...</div>
+      </div>
+
+      <!-- Dual View (Conversational Voice Mode with Claude reply) -->
+      <div class="dual-pane" id="dualPane" style="display: none;">
+        <div>
+          <div class="pane-header">
+            <span class="prompt-accent">Live Prompt (You)</span>
+          </div>
+          <div id="promptBox" class="pane-box">Speak here...</div>
+        </div>
+        <div>
+          <div class="pane-header">
+            <span class="claude-accent">Claude Reply (Contextual)</span>
+          </div>
+          <div id="claudeBox" class="pane-box">Claude will answer here...</div>
+        </div>
       </div>
 
       <div class="actions">
-        <button class="btn" id="newChatBtn" onclick="resetConversation()">New Session</button>
         <button class="btn" onclick="clearBoxes()">Clear</button>
-        <button class="btn" onclick="copyResult()">Copy Text</button>
+        <button class="btn" onclick="copyResult()">Copy Prompt</button>
       </div>
     </div>
 
     <div class="card">
-      <div class="card-title">API Integration Endpoints</div>
-      <p style="font-size:0.9rem; color:var(--text-muted); margin-bottom: 0.5rem;">
-        Connect to either streaming mode from your code or CLI:
-      </p>
+      <div class="card-title">WebSocket Endpoints</div>
       <div class="code-snippet">
-# 1. Conversational Audio Mode (Live prompt updates + Claude context response):<br>
+# 1. Smart Conversational SST (Real-time dynamic prompt updates &bull; No Claude answer &bull; Ephemeral):<br>
+ws://localhost:8000/ws/conversational_sst<br>
+Stream 16kHz PCM &rarr; Receive {"type": "interim", "text": "..."} &amp; {"type": "final", "text": "..."}
+      </div>
+      <div class="code-snippet">
+# 2. Full Conversational Audio Mode (Claude answers in context):<br>
 ws://localhost:8000/ws/voice?conversation_uuid=&lt;uuid&gt;<br>
-Stream 16kHz PCM audio &rarr; Receive {type: 'user_interim', text: '...'} &amp; {type: 'assistant_text_delta', text: '...'}
+Stream 16kHz PCM &rarr; Receive {"type": "user_interim", ...} &amp; {"type": "assistant_text_delta", ...}
       </div>
       <div class="code-snippet">
-# 2. Pure Dictation SST (Transcribe only):<br>
-ws://localhost:8000/ws/sst (or /v1/audio/transcriptions/stream)<br>
-Stream 16kHz PCM audio &rarr; Receive {type: 'final', text: '...'}
-      </div>
-      <div class="code-snippet">
-# 3. OpenAI-Compatible File Transcription (REST):<br>
-curl -X POST http://localhost:8000/v1/audio/transcriptions -F "file=@audio.mp3"
+# 3. Raw Dictation SST (Deepgram Nova-3):<br>
+ws://localhost:8000/ws/sst (or /ws)<br>
+Stream 16kHz PCM &rarr; Receive {"type": "final", "text": "..."}
       </div>
     </div>
   </div>
 
   <script>
-    let currentMode = 'voice';
+    let currentMode = 'smart_sst';
     let ws = null;
     let audioContext = null;
     let micStream = null;
     let processor = null;
     let isRecording = false;
-    let convUuid = null;
 
     const micBtn = document.getElementById('micBtn');
     const statusText = document.getElementById('statusText');
+    const singlePane = document.getElementById('singlePane');
+    const singleBox = document.getElementById('singleBox');
+    const singlePaneTitle = document.getElementById('singlePaneTitle');
+    const dualPane = document.getElementById('dualPane');
     const promptBox = document.getElementById('promptBox');
     const claudeBox = document.getElementById('claudeBox');
-    const sstBox = document.getElementById('sstBox');
-    const dualPane = document.getElementById('dualPane');
-    const sstPane = document.getElementById('sstPane');
     const activeModeTitle = document.getElementById('activeModeTitle');
+    const modeBadge = document.getElementById('modeBadge');
     const canvas = document.getElementById('viz');
     const canvasCtx = canvas.getContext('2d');
 
     function switchMode(mode) {
       if (isRecording) stopRecording();
       currentMode = mode;
-      document.getElementById('modeVoiceBtn').classList.toggle('active', mode === 'voice');
-      document.getElementById('modeSstBtn').classList.toggle('active', mode === 'sst');
+      document.getElementById('btnSmartSst').classList.toggle('active', mode === 'smart_sst');
+      document.getElementById('btnVoice').classList.toggle('active', mode === 'voice');
+      document.getElementById('btnSst').classList.toggle('active', mode === 'sst');
 
-      if (mode === 'voice') {
-        activeModeTitle.innerText = 'Conversational Audio Mode';
-        dualPane.style.display = 'grid';
-        sstPane.style.display = 'none';
-      } else {
-        activeModeTitle.innerText = 'Pure Dictation SST Mode';
+      if (mode === 'smart_sst') {
+        activeModeTitle.innerText = 'Smart Conversational SST';
+        modeBadge.innerText = 'Dynamic Prompting • No Answer';
+        singlePaneTitle.innerText = 'Live Conversational Prompt (Refined as you speak)';
+        singlePane.style.display = 'block';
         dualPane.style.display = 'none';
-        sstPane.style.display = 'block';
+      } else if (mode === 'voice') {
+        activeModeTitle.innerText = 'Conversational Audio Mode';
+        modeBadge.innerText = 'Full Turn Conversation';
+        singlePane.style.display = 'none';
+        dualPane.style.display = 'grid';
+      } else {
+        activeModeTitle.innerText = 'Raw Dictation SST';
+        modeBadge.innerText = 'Deepgram Nova-3';
+        singlePaneTitle.innerText = 'Transcribed Text';
+        singlePane.style.display = 'block';
+        dualPane.style.display = 'none';
       }
     }
 
-    function resetConversation() {
-      convUuid = ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
-        (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16)
-      );
-      promptBox.innerText = 'New session ready. Start speaking!';
-      claudeBox.innerText = '';
-      if (isRecording) stopRecording();
-    }
-    resetConversation();
-
     function clearBoxes() {
+      singleBox.innerText = '';
       promptBox.innerText = '';
       claudeBox.innerText = '';
-      sstBox.innerText = '';
     }
 
     function copyResult() {
       const text = currentMode === 'voice'
-        ? `Prompt: ${promptBox.innerText}\\n\\nClaude: ${claudeBox.innerText}`
-        : sstBox.innerText;
+        ? promptBox.innerText
+        : singleBox.innerText;
       navigator.clipboard.writeText(text);
-      alert('Copied to clipboard!');
+      alert('Prompt copied to clipboard!');
     }
 
     // Visualizer loop
@@ -399,7 +414,7 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions -F "file=@audio.mp3"
       analyser.getByteTimeDomainData(dataArray);
 
       canvasCtx.lineWidth = 2;
-      canvasCtx.strokeStyle = currentMode === 'voice' ? '#d97757' : '#22c55e';
+      canvasCtx.strokeStyle = '#d97757';
       canvasCtx.beginPath();
       const sliceWidth = canvas.width * 1.0 / bufferLength;
       let x = 0;
@@ -418,14 +433,14 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions -F "file=@audio.mp3"
     async function startRecording() {
       try {
         const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsPath = currentMode === 'voice'
-          ? `/ws/voice?conversation_uuid=${convUuid}`
-          : `/ws/sst`;
+        let wsPath = '/ws/conversational_sst';
+        if (currentMode === 'voice') wsPath = '/ws/voice';
+        else if (currentMode === 'sst') wsPath = '/ws/sst';
 
         ws = new WebSocket(`${wsProto}//${window.location.host}${wsPath}`);
 
         ws.onopen = async () => {
-          statusText.innerText = "Listening... Speak now";
+          statusText.innerText = "Listening... Speak naturally";
           micBtn.classList.add('recording');
           isRecording = true;
 
@@ -454,7 +469,7 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions -F "file=@audio.mp3"
             if (!isRecording || ws.readyState !== WebSocket.OPEN) return;
             const inputData = e.inputBuffer.getChannelData(0);
 
-            // Resample to 16000Hz
+            // Resample to 16000Hz PCM
             const downsampledLength = Math.floor(inputData.length * (targetSampleRate / inputSampleRate));
             const pcm16 = new Int16Array(downsampledLength);
             for (let i = 0; i < downsampledLength; i++) {
@@ -473,25 +488,18 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions -F "file=@audio.mp3"
           const data = JSON.parse(event.data);
           const t = data.type;
 
-          if (currentMode === 'voice') {
+          if (currentMode === 'smart_sst' || currentMode === 'sst') {
+            if (t === 'interim' || t === 'final') {
+              singleBox.innerText = data.text;
+              singleBox.scrollTop = singleBox.scrollHeight;
+            }
+          } else if (currentMode === 'voice') {
             if (t === 'user_interim') {
               promptBox.innerText = data.text;
               promptBox.scrollTop = promptBox.scrollHeight;
-            } else if (t === 'user_speech_end') {
-              if (data.final_prompt) promptBox.innerText = data.final_prompt;
-              claudeBox.innerText = '';
-              statusText.innerText = "Claude is thinking and replying...";
             } else if (t === 'assistant_text_delta') {
               claudeBox.innerText += data.text;
               claudeBox.scrollTop = claudeBox.scrollHeight;
-            } else if (t === 'playback_end') {
-              statusText.innerText = "Listening... Speak whenever you're ready";
-            }
-          } else {
-            // Pure SST
-            if (t === 'interim' || t === 'final') {
-              sstBox.innerText = data.text;
-              sstBox.scrollTop = sstBox.scrollHeight;
             }
           }
         };
@@ -569,7 +577,80 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 # =====================================================================
-# WebSocket: Mode 1 - Conversational Voice Mode (Context + Live Prompts)
+# WebSocket 1: Smart Conversational SST (Live Dynamic Prompt, NO Claude Answer)
+# =====================================================================
+@routes.get("/v1/audio/transcriptions/conversational")
+@routes.get("/ws/conversational_sst")
+@routes.get("/ws/smart_sst")
+async def handle_ws_smart_sst(request: web.Request) -> web.WebSocketResponse:
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+
+    language = request.query.get("language", "en")
+    logger.info("Client connected to Smart Conversational SST (suppress reply mode)")
+
+    voice_session = ClaudeVoiceSession(
+        language=language,
+        suppress_reply=True,
+        ephemeral=True,
+    )
+
+    try:
+        await voice_session.connect()
+    except Exception as e:
+        logger.error(f"Failed to connect upstream to Claude Voice Mode: {e}")
+        await ws.send_json({"type": "error", "error": f"Upstream connection failed: {e}"})
+        await ws.close()
+        return ws
+
+    async def forward_audio():
+        try:
+            async for msg in ws:
+                if msg.type == web.WSMsgType.BINARY:
+                    await voice_session.send_audio(msg.data)
+                elif msg.type == web.WSMsgType.TEXT:
+                    try:
+                        data = json.loads(msg.data)
+                        if data.get("action") == "stop":
+                            await voice_session.send_interrupt()
+                            break
+                    except Exception:
+                        pass
+                elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
+                    break
+        except Exception as e:
+            logger.debug(f"Smart SST forward error: {e}")
+
+    async def forward_events():
+        try:
+            async for event in voice_session.receive_events():
+                if ws.closed:
+                    break
+                await ws.send_json(event)
+        except Exception as e:
+            logger.debug(f"Smart SST event error: {e}")
+
+    client_task = asyncio.create_task(forward_audio())
+    server_task = asyncio.create_task(forward_events())
+
+    done, pending = await asyncio.wait(
+        [client_task, server_task],
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+
+    for task in pending:
+        task.cancel()
+
+    await voice_session.close()
+    if not ws.closed:
+        await ws.close()
+
+    logger.info("Smart Conversational SST session closed.")
+    return ws
+
+
+# =====================================================================
+# WebSocket 2: Full Conversational Voice Mode (Context + Claude Answers)
 # =====================================================================
 @routes.get("/v1/voice/stream")
 @routes.get("/ws/voice")
@@ -581,14 +662,16 @@ async def handle_ws_voice(request: web.Request) -> web.WebSocketResponse:
     language = request.query.get("language", "en")
     voice = request.query.get("voice", "buttery")
     model = request.query.get("model")
+    suppress_reply = request.query.get("suppress_reply", "false").lower() in ("true", "1")
 
-    logger.info(f"Client connected to Conversational Voice Mode (conv: {conv_uuid})")
+    logger.info(f"Client connected to Conversational Voice Mode (conv: {conv_uuid}, suppress: {suppress_reply})")
 
     voice_session = ClaudeVoiceSession(
         conversation_uuid=conv_uuid,
         language=language,
         voice=voice,
         model=model,
+        suppress_reply=suppress_reply,
     )
 
     try:
@@ -599,7 +682,7 @@ async def handle_ws_voice(request: web.Request) -> web.WebSocketResponse:
         await ws.close()
         return ws
 
-    async def forward_client_to_upstream():
+    async def forward_client():
         try:
             async for msg in ws:
                 if msg.type == web.WSMsgType.BINARY:
@@ -618,22 +701,17 @@ async def handle_ws_voice(request: web.Request) -> web.WebSocketResponse:
         except Exception as e:
             logger.debug(f"Voice client forward error: {e}")
 
-    async def forward_upstream_to_client():
+    async def forward_upstream():
         try:
             async for event in voice_session.receive_events():
                 if ws.closed:
                     break
-                if event.get("type") == "assistant_audio":
-                    # Audio bytes to client if needed
-                    # Only send if client requested binary audio, or ignore
-                    pass
-                else:
-                    await ws.send_json(event)
+                await ws.send_json(event)
         except Exception as e:
             logger.debug(f"Voice downstream forward error: {e}")
 
-    client_task = asyncio.create_task(forward_client_to_upstream())
-    server_task = asyncio.create_task(forward_upstream_to_client())
+    client_task = asyncio.create_task(forward_client())
+    server_task = asyncio.create_task(forward_upstream())
 
     done, pending = await asyncio.wait(
         [client_task, server_task],
@@ -652,7 +730,7 @@ async def handle_ws_voice(request: web.Request) -> web.WebSocketResponse:
 
 
 # =====================================================================
-# WebSocket: Mode 2 - Pure Dictation SST (/ws, /ws/sst)
+# WebSocket 3: Raw Dictation SST (/ws, /ws/sst)
 # =====================================================================
 @routes.get("/v1/audio/transcriptions/stream")
 @routes.get("/ws/sst")
@@ -725,6 +803,7 @@ async def handle_transcriptions(request: web.Request) -> web.Response:
     reader = await request.multipart()
     audio_bytes = None
     language = "en"
+    engine = "conversational"  # default to high quality conversational engine
 
     while True:
         field = await reader.next()
@@ -734,6 +813,8 @@ async def handle_transcriptions(request: web.Request) -> web.Response:
             audio_bytes = await field.read()
         elif field.name == "language":
             language = (await field.read()).decode("utf-8").strip()
+        elif field.name == "engine":
+            engine = (await field.read()).decode("utf-8").strip()
 
     if not audio_bytes:
         return web.json_response({"error": "No audio file provided in request"}, status=400)
@@ -762,37 +843,65 @@ async def handle_transcriptions(request: web.Request) -> web.Response:
         logger.error(f"Failed to transcode audio: {e}")
         return web.json_response({"error": f"Transcoder error: {e}"}, status=500)
 
-    # Stream to Claude SST and collect final text
     final_text = ""
-    claude_session = ClaudeSSTSession(language=language)
-    try:
-        await claude_session.connect()
 
-        async def send_audio_chunks():
-            chunk_size = 3200
-            for i in range(0, len(pcm_data), chunk_size):
-                await claude_session.send_audio(pcm_data[i:i+chunk_size])
-                await asyncio.sleep(0.04)
-            for _ in range(12):
-                await claude_session.send_audio(b"\x00" * 3200)
-                await asyncio.sleep(0.04)
-            await asyncio.sleep(0.8)
+    if engine == "conversational":
+        voice_session = ClaudeVoiceSession(language=language, suppress_reply=True, ephemeral=True)
+        try:
+            await voice_session.connect()
+
+            async def send_audio():
+                chunk_size = 3200
+                for i in range(0, len(pcm_data), chunk_size):
+                    await voice_session.send_audio(pcm_data[i:i+chunk_size])
+                    await asyncio.sleep(0.04)
+                for _ in range(12):
+                    await voice_session.send_audio(b"\x00" * 3200)
+                    await asyncio.sleep(0.04)
+                await voice_session.send_interrupt()
+                await asyncio.sleep(0.5)
+                await voice_session.close()
+
+            sender = asyncio.create_task(send_audio())
+            async for event in voice_session.receive_events():
+                if event.get("type") in ("final", "interim"):
+                    txt = event.get("text", "")
+                    if txt:
+                        final_text = txt
+            await sender
+        except Exception as e:
+            logger.error(f"Error during conversational transcription: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+        finally:
+            await voice_session.close()
+    else:
+        claude_session = ClaudeSSTSession(language=language)
+        try:
+            await claude_session.connect()
+
+            async def send_audio_chunks():
+                chunk_size = 3200
+                for i in range(0, len(pcm_data), chunk_size):
+                    await claude_session.send_audio(pcm_data[i:i+chunk_size])
+                    await asyncio.sleep(0.04)
+                for _ in range(12):
+                    await claude_session.send_audio(b"\x00" * 3200)
+                    await asyncio.sleep(0.04)
+                await asyncio.sleep(0.8)
+                await claude_session.close()
+
+            sender = asyncio.create_task(send_audio_chunks())
+            async for event in claude_session.receive_events():
+                if event.get("type") in ("final", "interim"):
+                    txt = event.get("text", "")
+                    if txt:
+                        final_text = txt
+            await sender
+        except Exception as e:
+            logger.error(f"Error during transcription: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+        finally:
             await claude_session.close()
-
-        sender = asyncio.create_task(send_audio_chunks())
-
-        async for event in claude_session.receive_events():
-            if event.get("type") in ("final", "interim"):
-                txt = event.get("text", "")
-                if txt:
-                    final_text = txt
-
-        await sender
-    except Exception as e:
-        logger.error(f"Error during transcription: {e}")
-        return web.json_response({"error": str(e)}, status=500)
-    finally:
-        await claude_session.close()
 
     return web.json_response({"text": final_text})
 

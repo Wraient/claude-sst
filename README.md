@@ -2,90 +2,70 @@
 
 A local bidirectional streaming proxy and API for Anthropic Claude Web's Voice & Dictation engines.
 
-Supports two distinct modes:
-1. **Conversational Audio Mode** (`/ws/voice`): Full bidirectional conversation with Claude. Updates your prompt dynamically as you speak, keeps track of conversational context, and streams Claude's thought and response tokens back in real time.
-2. **Pure Dictation SST Mode** (`/ws/sst` or `/ws`): Fast raw speech-to-text dictation without assistant reasoning or replies (using Deepgram Nova-3).
-3. **OpenAI-Compatible REST API** (`POST /v1/audio/transcriptions`): For transcribing recorded audio files (WAV, MP3, M4A, WebM, etc.).
-
 ---
 
-## Architecture & Reverse-Engineered Endpoints
+## 3 Operating Modes Available
 
-Claude Web uses two distinct WebSocket services:
-
-| Feature | Endpoint | Description |
+| Mode | Endpoint | Description |
 | :--- | :--- | :--- |
-| **Conversational Audio** | `wss://claude.ai/api/ws/voice/organizations/{org_id}/chat_conversations/{conv_uuid}` | Live prompt transcription, conversational turn management, context memory, and streaming assistant responses. |
-| **Dictation SST** | `wss://claude.ai/api/ws/speech_to_text/voice_stream` | Low-latency speech-to-text dictation using `deepgram-nova3` directly into input boxes. |
-
-### Audio Specifications
-- **Format**: Linear PCM 16-bit little-endian (`linear16` / `s16le`)
-- **Sample Rate**: 16,000 Hz
-- **Channels**: 1 (mono)
-- **Framing**: ~40ms - 100ms chunks (1280 - 3200 bytes per chunk)
+| **Smart Conversational SST** *(Recommended)* | `ws://localhost:8000/ws/conversational_sst` | **Dynamic prompt updating & context-aware transcription WITHOUT Claude answering.** As you speak, the prompt refines in real time. Claude's LLM reply is automatically interrupted and suppressed, and temporary sessions are cleanly deleted. |
+| **Full Conversational Voice** | `ws://localhost:8000/ws/voice` | Full two-way voice chat. Updates prompt live, then streams Claude's contextual assistant reply (tokens + audio). |
+| **Raw Dictation SST** | `ws://localhost:8000/ws/sst` | Raw low-latency Deepgram Nova-3 transcription. |
 
 ---
 
-## Features
+## How Smart Conversational SST Works (No Claude Answer)
 
-- **Automatic Cookie Decryption**: Decrypts active `sessionKey`, `lastActiveOrg`, and Cloudflare clearance cookies from Google Chrome's Linux Gnome Keyring (`v11` AES-128-CBC) with zero configuration.
-- **Conversational Audio Mode**:
-  - Live interim prompt updates as words are spoken (`user_interim`).
-  - Turn boundary endpointing (`user_speech_end`).
-  - Token-by-token assistant text generation (`assistant_text_delta`).
-  - Full conversation context retention across multiple voice turns.
-- **Pure Dictation SST Mode**:
-  - Fast interim and final transcription hypotheses (`interim`, `final`).
-- **OpenAI-Compatible REST Endpoint**: `POST /v1/audio/transcriptions` with on-the-fly `ffmpeg` transcoding.
-- **Interactive Web UI**: Built-in web client at `http://localhost:8000` with visualizer, dual-pane conversation/prompt monitor, mode switcher, and mic recording.
+Claude's conversational voice model (`/api/ws/voice/organizations/{org_id}/chat_conversations/{conv_uuid}`) provides far superior, grammatically refined prompt transcription compared to raw dictation.
+
+To get this conversational prompt transcription **without Claude answering or cluttering your account**, the proxy implements a 3-part pipeline:
+1. **Live Prompt Extraction**: Consumes `transcript_interim` events from Claude's voice WebSocket, continuously streaming refined prompt sentences to your client.
+2. **Instant Server Interruption**: As soon as speech pause/end is detected (`user_input_end`), the proxy immediately transmits an upstream `{"type": "interrupt"}` control frame to Claude's server, aborting assistant LLM inference and TTS before any reply is produced.
+3. **Incognito & Ephemeral Cleanup**: Establishes the session with `chat_memory_mode: disabled` and issues a `DELETE /api/organizations/{org}/chat_conversations/{conv_uuid}` when closed, leaving zero trace in your chat sidebar.
 
 ---
 
 ## Quick Start
 
-### 1. Launch the Server
+### 1. Launch Proxy Server
 ```bash
 python3 server.py
 ```
-Server runs on `http://127.0.0.1:8000`.
+Runs at `http://127.0.0.1:8000`.
 
 ### 2. Run Test Suite
 ```bash
 python3 test_client.py
 ```
 
-### 3. Open Web UI
-Visit [http://localhost:8000](http://localhost:8000) in your browser:
-- Switch between **Conversational Audio Mode** and **Dictation SST**.
-- Tap the microphone button and start speaking.
+### 3. Open Interactive Web UI
+Visit [http://localhost:8000](http://localhost:8000):
+- Select **Smart Conversational SST (No Claude Answer)**.
+- Tap the microphone button and start speaking naturally.
+- Watch your prompt update live, refined as you speak, with zero assistant responses.
 
 ---
 
 ## API Reference
 
-### 1. Conversational Audio WebSocket (`/ws/voice`)
-Connect to: `ws://127.0.0.1:8000/ws/voice?conversation_uuid=<uuid>`
+### 1. Smart Conversational SST WebSocket
+Connect to: `ws://127.0.0.1:8000/ws/conversational_sst` (or `/ws/smart_sst`)
 
-- **Send**: Binary 16kHz 16-bit mono PCM chunks.
+- **Send**: Raw binary chunks of 16kHz, 16-bit mono signed PCM (`Int16Array`).
 - **Receive**:
   ```json
-  {"type": "user_interim", "text": "Hi there I just want to"}
-  {"type": "user_speech_end", "final_prompt": "Hi there. I just want to..."}
-  {"type": "assistant_text_delta", "text": "Hello! How can I help you today?"}
+  {"type": "interim", "text": "Hi there I just want to"}
+  {"type": "final", "text": "Hi there. I just want to share how thrilled I am to work with you."}
   ```
 
-### 2. Dictation SST WebSocket (`/ws/sst` or `/ws`)
-Connect to: `ws://127.0.0.1:8000/ws/sst`
-
-- **Send**: Binary 16kHz 16-bit mono PCM chunks.
-- **Receive**:
-  ```json
-  {"type": "final", "text": "Transcribed speech text here..."}
-  ```
-
-### 3. OpenAI-Compatible REST API
+### 2. OpenAI-Compatible REST API
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/audio/transcriptions \
-  -F "file=@audio.wav" \
-  -F "model=claude-sst"
+  -F "file=@speech.wav"
+```
+Defaults to the high-quality Conversational engine. Response:
+```json
+{
+  "text": "Hi there. I just want to share how thrilled I am to work with you. And I can't wait to get started. So what's the game plan?"
+}
 ```
